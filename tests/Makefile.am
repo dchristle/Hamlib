@@ -31,6 +31,7 @@ DIRECT_TESTS = \
 	testicomts \
 	testnewcatset \
 	testrigctlprotocol \
+	testmodecompat \
 	testthd7x \
 	testthd75emu \
 	testid5100
@@ -158,6 +159,7 @@ testnetrigctl_LDADD = $(PTHREAD_LIBS) $(top_builddir)/rigs/dummy/libhamlib-dummy
 testctlparser_SOURCES = testctlparser.c $(RIGCOMMONSRC)
 testctlparser_LDADD = $(PTHREAD_LIBS) $(READLINE_LIBS) $(top_builddir)/rigs/dummy/libhamlib-dummy.la $(LDADD)
 testrigctlprotocol_LDADD = $(LDADD)
+testmodecompat_LDADD = $(top_builddir)/rigs/dummy/libhamlib-dummy.la $(LDADD)
 testicomts_LDADD = $(top_builddir)/rigs/icom/libhamlib-icom.la $(LDADD)
 testid5100_LDADD = $(NET_LIBS) $(PTHREAD_LIBS) $(top_builddir)/rigs/icom/libhamlib-icom.la $(LDADD)
 testicomfallback_LDADD = $(NET_LIBS) $(PTHREAD_LIBS) $(top_builddir)/rigs/icom/libhamlib-icom.la $(LDADD)
