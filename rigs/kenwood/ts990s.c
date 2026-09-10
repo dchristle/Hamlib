@@ -125,7 +125,8 @@ enum ts990s_filter_kind
     TS990S_FILTER_FM,
     TS990S_FILTER_CW,
     TS990S_FILTER_FSK,
-    TS990S_FILTER_PSK
+    TS990S_FILTER_PSK,
+    TS990S_FILTER_SSB_WIDTH
 };
 
 static const int ts990s_ssb_high[] =
@@ -141,7 +142,8 @@ static const int ts990s_am_high[] =
 static const int ts990s_am_low[] = { 0, 100, 200, 300 };
 static const int ts990s_fm_high[] =
     { 1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900,
-      2000, 2100, 2200, 2300, 2400, 2500 };
+      2000, 2100, 2200, 2300, 2400, 2500, 2600, 2700, 2800, 2900,
+      3000, 3400, 4000, 5000 };
 static const int ts990s_fm_low[] =
     { 0, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000 };
 static const int ts990s_cw_width[] =
@@ -208,7 +210,8 @@ static int ts990s_set_filter_id(RIG *rig, const char *command, vfo_t vfo, int id
 {
     char cmd[16];
     struct kenwood_priv_data *priv = STATE(rig)->priv;
-    int digits = priv->fw_rev_uint >= 120 ? 3 : 2;
+    /* Only SH gained a third ID digit in firmware 1.20; SL stays two digits. */
+    int digits = strcmp(command, "SH") == 0 && priv->fw_rev_uint >= 120 ? 3 : 2;
 
     SNPRINTF(cmd, sizeof(cmd), "%s%d%0*d", command, ts990s_filter_band(vfo), digits, id);
     return kenwood_transaction(rig, cmd, NULL, 0);
@@ -226,9 +229,91 @@ static int ts990s_select_width(const int *values, size_t count, pbwidth_t width)
     return (int)(count - 1);
 }
 
+struct ts990s_filter
+{
+    const int *high;
+    size_t high_count;
+    const int *low;
+    size_t low_count;
+};
+
+static const int ts990s_ssb_width[] =
+    { 50, 80, 100, 150, 200, 250, 300, 350, 400, 450, 500, 600,
+      700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500, 1600,
+      1700, 1800, 1900, 2000, 2100, 2200, 2300, 2400, 2500,
+      2600, 2700, 2800, 2900, 3000 };
+static const int ts990s_legacy_high[] =
+    { 1000, 1200, 1400, 1600, 1800, 2000, 2200, 2400, 2600,
+      2800, 3000, 3400, 4000, 5000 };
+static const int ts990s_legacy_am_high[] = { 2500, 3000, 4000, 5000 };
+static const int ts990s_legacy_ssb_width[] =
+    { 50, 80, 100, 150, 200, 250, 300, 400, 500, 600, 1000,
+      1500, 2000, 2200, 2400, 2600, 2800, 3000 };
+static const int ts990s_legacy_cw_width[] =
+    { 50, 80, 100, 150, 200, 250, 300, 400, 500, 600, 1000, 1500, 2000, 2500 };
+static const int ts990s_legacy_fsk_width[] = { 250, 300, 400, 500, 1000, 1500 };
+static const int ts990s_legacy_psk_width[] =
+    { 50, 80, 100, 150, 200, 250, 300, 400, 500, 600, 1000, 1500 };
+
+#define FILTER_TABLE(values) values, sizeof(values) / sizeof((values)[0])
+
+static int ts990s_filter_for_mode(RIG *rig, rmode_t mode,
+                                  const struct ts990s_filter **filter)
+{
+    /* A missing high-cut table means SL directly represents bandwidth. */
+    static const struct ts990s_filter modern[] =
+    {
+        [TS990S_FILTER_SSB] = { FILTER_TABLE(ts990s_ssb_high), FILTER_TABLE(ts990s_ssb_low) },
+        [TS990S_FILTER_AM] = { FILTER_TABLE(ts990s_am_high), FILTER_TABLE(ts990s_am_low) },
+        [TS990S_FILTER_FM] = { FILTER_TABLE(ts990s_fm_high), FILTER_TABLE(ts990s_fm_low) },
+        [TS990S_FILTER_CW] = { NULL, 0, FILTER_TABLE(ts990s_cw_width) },
+        [TS990S_FILTER_FSK] = { NULL, 0, FILTER_TABLE(ts990s_fsk_width) },
+        [TS990S_FILTER_PSK] = { NULL, 0, FILTER_TABLE(ts990s_psk_width) },
+        [TS990S_FILTER_SSB_WIDTH] = { NULL, 0, FILTER_TABLE(ts990s_ssb_width) }
+    };
+    static const struct ts990s_filter legacy[] =
+    {
+        [TS990S_FILTER_SSB] = { FILTER_TABLE(ts990s_legacy_high), FILTER_TABLE(ts990s_fm_low) },
+        [TS990S_FILTER_AM] = { FILTER_TABLE(ts990s_legacy_am_high), FILTER_TABLE(ts990s_am_low) },
+        [TS990S_FILTER_FM] = { FILTER_TABLE(ts990s_legacy_high), FILTER_TABLE(ts990s_fm_low) },
+        [TS990S_FILTER_CW] = { NULL, 0, FILTER_TABLE(ts990s_legacy_cw_width) },
+        [TS990S_FILTER_FSK] = { NULL, 0, FILTER_TABLE(ts990s_legacy_fsk_width) },
+        [TS990S_FILTER_PSK] = { NULL, 0, FILTER_TABLE(ts990s_legacy_psk_width) },
+        [TS990S_FILTER_SSB_WIDTH] = { NULL, 0, FILTER_TABLE(ts990s_legacy_ssb_width) }
+    };
+    struct kenwood_priv_data *priv = STATE(rig)->priv;
+    int kind = ts990s_filter_kind(mode);
+
+    if (kind < 0) { return -RIG_ENAVAIL; }
+
+    if (kind == TS990S_FILTER_SSB)
+    {
+        const char *cmd = (mode & TS990S_PACKET_MODES) ? "EX00608" : "EX00607";
+        char response[16];
+        int retval = kenwood_transaction(rig, cmd, response, sizeof(response));
+
+        if (retval != RIG_OK) { return retval; }
+
+        if (strlen(response) != 11 || strncmp(response, cmd, 7) != 0
+                || (strcmp(response + 7, " 000") != 0
+                    && strcmp(response + 7, " 001") != 0))
+        {
+            return -RIG_EPROTO;
+        }
+
+        if (response[10] == '1') { kind = TS990S_FILTER_SSB_WIDTH; }
+    }
+
+    *filter = &(priv->fw_rev_uint >= 120 ? modern : legacy)[kind];
+    return RIG_OK;
+}
+
+#undef FILTER_TABLE
+
 int ts990s_set_filter_width(RIG *rig, vfo_t vfo, rmode_t mode, pbwidth_t width)
 {
-    enum ts990s_filter_kind kind;
+    const struct ts990s_filter *filter;
+    int retval;
 
     if (width == RIG_PASSBAND_NOCHANGE) { return RIG_OK; }
 
@@ -236,169 +321,60 @@ int ts990s_set_filter_width(RIG *rig, vfo_t vfo, rmode_t mode, pbwidth_t width)
 
     if (width <= 0) { return -RIG_EINVAL; }
 
-    kind = ts990s_filter_kind(mode);
+    retval = ts990s_filter_for_mode(rig, mode, &filter);
 
-    if (kind == TS990S_FILTER_CW)
-    {
-        return ts990s_set_filter_id(rig, "SL", vfo,
-                                    ts990s_select_width(ts990s_cw_width,
-                                            sizeof(ts990s_cw_width) / sizeof(int), width));
-    }
+    if (retval != RIG_OK) { return retval; }
 
-    if (kind == TS990S_FILTER_FSK)
+    if (filter->high)
     {
-        return ts990s_set_filter_id(rig, "SL", vfo,
-                                    ts990s_select_width(ts990s_fsk_width,
-                                            sizeof(ts990s_fsk_width) / sizeof(int), width));
-    }
-
-    if (kind == TS990S_FILTER_PSK)
-    {
-        return ts990s_set_filter_id(rig, "SL", vfo,
-                                    ts990s_select_width(ts990s_psk_width,
-                                            sizeof(ts990s_psk_width) / sizeof(int), width));
-    }
-
-    {
-        const int *high;
-        const int *low;
-        size_t high_count;
-        size_t low_count;
         int low_id;
-        int target;
-        int retval;
-
-        switch (kind)
-        {
-        case TS990S_FILTER_AM:
-            high = ts990s_am_high;
-            high_count = sizeof(ts990s_am_high) / sizeof(int);
-            low = ts990s_am_low;
-            low_count = sizeof(ts990s_am_low) / sizeof(int);
-            break;
-
-        case TS990S_FILTER_FM:
-            high = ts990s_fm_high;
-            high_count = sizeof(ts990s_fm_high) / sizeof(int);
-            low = ts990s_fm_low;
-            low_count = sizeof(ts990s_fm_low) / sizeof(int);
-            break;
-
-        case TS990S_FILTER_SSB:
-            high = ts990s_ssb_high;
-            high_count = sizeof(ts990s_ssb_high) / sizeof(int);
-            low = ts990s_ssb_low;
-            low_count = sizeof(ts990s_ssb_low) / sizeof(int);
-            break;
-
-        default:
-            return -RIG_ENAVAIL;
-        }
-
         retval = ts990s_read_filter_id(rig, "SL", vfo, &low_id);
 
         if (retval != RIG_OK) { return retval; }
 
-        if (low_id < 0 || (size_t)low_id >= low_count) { return -RIG_EPROTO; }
+        if (low_id < 0 || (size_t)low_id >= filter->low_count) { return -RIG_EPROTO; }
 
-        target = low[low_id] + width;
         return ts990s_set_filter_id(rig, "SH", vfo,
-                                     ts990s_select_width(high, high_count, target));
+                   ts990s_select_width(filter->high, filter->high_count,
+                                       filter->low[low_id] + width));
     }
+
+    return ts990s_set_filter_id(rig, "SL", vfo,
+               ts990s_select_width(filter->low, filter->low_count, width));
 }
 
 int ts990s_get_filter_width(RIG *rig, vfo_t vfo, rmode_t mode, pbwidth_t *width)
 {
-    enum ts990s_filter_kind kind;
+    const struct ts990s_filter *filter;
+    int low_id, high_id;
+    int retval;
 
     if (!width) { return -RIG_EINVAL; }
 
-    kind = ts990s_filter_kind(mode);
+    retval = ts990s_filter_for_mode(rig, mode, &filter);
 
-    if (kind == TS990S_FILTER_CW || kind == TS990S_FILTER_FSK || kind == TS990S_FILTER_PSK)
+    if (retval != RIG_OK) { return retval; }
+
+    retval = ts990s_read_filter_id(rig, "SL", vfo, &low_id);
+
+    if (retval != RIG_OK) { return retval; }
+
+    if (low_id < 0 || (size_t)low_id >= filter->low_count) { return -RIG_EPROTO; }
+
+    if (!filter->high)
     {
-        const int *values;
-        size_t count;
-        int id;
-        int retval = ts990s_read_filter_id(rig, "SL", vfo, &id);
-
-        if (retval != RIG_OK) { return retval; }
-
-        if (kind == TS990S_FILTER_CW)
-        {
-            values = ts990s_cw_width;
-            count = sizeof(ts990s_cw_width) / sizeof(int);
-        }
-        else if (kind == TS990S_FILTER_FSK)
-        {
-            values = ts990s_fsk_width;
-            count = sizeof(ts990s_fsk_width) / sizeof(int);
-        }
-        else
-        {
-            values = ts990s_psk_width;
-            count = sizeof(ts990s_psk_width) / sizeof(int);
-        }
-
-        if (id < 0 || (size_t)id >= count) { return -RIG_EPROTO; }
-
-        *width = values[id];
+        *width = filter->low[low_id];
         return RIG_OK;
     }
 
-    {
-        const int *high;
-        const int *low;
-        size_t high_count;
-        size_t low_count;
-        int high_id;
-        int low_id;
-        int retval;
+    retval = ts990s_read_filter_id(rig, "SH", vfo, &high_id);
 
-        switch (kind)
-        {
-        case TS990S_FILTER_AM:
-            high = ts990s_am_high;
-            high_count = sizeof(ts990s_am_high) / sizeof(int);
-            low = ts990s_am_low;
-            low_count = sizeof(ts990s_am_low) / sizeof(int);
-            break;
+    if (retval != RIG_OK) { return retval; }
 
-        case TS990S_FILTER_FM:
-            high = ts990s_fm_high;
-            high_count = sizeof(ts990s_fm_high) / sizeof(int);
-            low = ts990s_fm_low;
-            low_count = sizeof(ts990s_fm_low) / sizeof(int);
-            break;
+    if (high_id < 0 || (size_t)high_id >= filter->high_count) { return -RIG_EPROTO; }
 
-        case TS990S_FILTER_SSB:
-            high = ts990s_ssb_high;
-            high_count = sizeof(ts990s_ssb_high) / sizeof(int);
-            low = ts990s_ssb_low;
-            low_count = sizeof(ts990s_ssb_low) / sizeof(int);
-            break;
-
-        default:
-            return -RIG_ENAVAIL;
-        }
-
-        retval = ts990s_read_filter_id(rig, "SH", vfo, &high_id);
-
-        if (retval != RIG_OK) { return retval; }
-
-        retval = ts990s_read_filter_id(rig, "SL", vfo, &low_id);
-
-        if (retval != RIG_OK) { return retval; }
-
-        if (high_id < 0 || (size_t)high_id >= high_count
-                || low_id < 0 || (size_t)low_id >= low_count)
-        {
-            return -RIG_EPROTO;
-        }
-
-        *width = high[high_id] - low[low_id];
-        return RIG_OK;
-    }
+    *width = filter->high[high_id] - filter->low[low_id];
+    return RIG_OK;
 }
 
 static struct kenwood_priv_caps  ts990s_priv_caps  =

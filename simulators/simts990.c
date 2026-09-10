@@ -137,7 +137,7 @@ int main(int argc, char *argv[])
         else if (strcmp(buf, "FV;") == 0)
         {
             hl_usleep(mysleep * 1000);
-            pbuf = "FV1.2;";
+            pbuf = "FV1.20;";
             write(fd, pbuf, strlen(pbuf));
             continue;
         }
@@ -216,6 +216,12 @@ int main(int argc, char *argv[])
             SNPRINTF(buf, sizeof(buf), "EX032%1d;", ant);
             write(fd, buf, strlen(buf));
             continue;
+        }
+        else if (strcmp(buf, "EX00607;") == 0 || strcmp(buf, "EX00608;") == 0)
+        {
+            buf[7] = '\0';
+            strcat(buf, " 000;");
+            write(fd, buf, strlen(buf));
         }
         else if (strncmp(buf, "EX", 2) == 0)
         {
@@ -609,7 +615,7 @@ int main(int argc, char *argv[])
 
         else if (strcmp(buf, "SL0;") == 0)
         {
-            sprintf(buf, "SL0%03d;", sl0);
+            sprintf(buf, "SL0%02d;", sl0);
             write(fd, buf, strlen(buf));
         }
         else if (strncmp(buf, "SL0", 3) == 0)
@@ -618,7 +624,7 @@ int main(int argc, char *argv[])
         }
         else if (strcmp(buf, "SL1;") == 0)
         {
-            sprintf(buf, "SL1%03d;", sl1);
+            sprintf(buf, "SL1%02d;", sl1);
             write(fd, buf, strlen(buf));
         }
         else if (strncmp(buf, "SL1", 3) == 0)
