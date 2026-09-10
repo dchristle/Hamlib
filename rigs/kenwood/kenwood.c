@@ -871,6 +871,8 @@ int kenwood_init(RIG *rig)
     priv->split = RIG_SPLIT_OFF;
     priv->trn_state = -1;
     priv->curr_mode = 0;
+    /* Use the current TS-990S filter format until FV confirms older firmware. */
+    if (RIG_IS_TS990S) { priv->fw_rev_uint = 120; }
     priv->micgain_min = -1;
     priv->micgain_max = -1;
     priv->has_ps = 1;  // until proven otherwise
@@ -2609,6 +2611,11 @@ int kenwood_set_mode(RIG *rig, vfo_t vfo, rmode_t mode, pbwidth_t width)
         SNPRINTF(buf, sizeof(buf), "OM0%c", c);  /* target vfo is ignored */
         err = kenwood_transaction(rig, buf, NULL, 0);
 
+        if (err == RIG_OK && width != RIG_PASSBAND_NOCHANGE)
+        {
+            err = ts990s_set_filter_width(rig, vfo, mode, width);
+        }
+
         if (vfo != RIG_VFO_CURR && vfo != curr_vfo)
         {
             int err2;
@@ -2994,6 +3001,10 @@ int kenwood_get_mode(RIG *rig, vfo_t vfo, rmode_t *mode, pbwidth_t *width)
                       __func__, retval);
             *width = rig_passband_normal(rig, *mode);
         }
+    }
+    else if (RIG_IS_TS990S)
+    {
+        retval = ts990s_get_filter_width(rig, vfo, *mode, width);
     }
     else
     {

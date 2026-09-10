@@ -118,6 +118,289 @@ static rmode_t ts990s_mode_table[KENWOOD_MODE_TABLE_MAX] =
     [23] = RIG_MODE_NONE,               /* N */
 };
 
+enum ts990s_filter_kind
+{
+    TS990S_FILTER_SSB,
+    TS990S_FILTER_AM,
+    TS990S_FILTER_FM,
+    TS990S_FILTER_CW,
+    TS990S_FILTER_FSK,
+    TS990S_FILTER_PSK
+};
+
+static const int ts990s_ssb_high[] =
+    { 600, 700, 800, 900, 1000, 1100, 1200, 1300, 1400, 1500,
+      1600, 1700, 1800, 1900, 2000, 2100, 2200, 2300, 2400, 2500,
+      2600, 2700, 2800, 2900, 3000, 3400, 4000, 5000 };
+static const int ts990s_ssb_low[] =
+    { 0, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000,
+      1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900, 2000 };
+static const int ts990s_am_high[] =
+    { 2000, 2100, 2200, 2300, 2400, 2500, 2600, 2700, 2800, 2900,
+      3000, 3500, 4000, 5000 };
+static const int ts990s_am_low[] = { 0, 100, 200, 300 };
+static const int ts990s_fm_high[] =
+    { 1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900,
+      2000, 2100, 2200, 2300, 2400, 2500 };
+static const int ts990s_fm_low[] =
+    { 0, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000 };
+static const int ts990s_cw_width[] =
+    { 50, 80, 100, 150, 200, 250, 300, 350, 400, 450, 500, 600,
+      700, 800, 900, 1000, 1500, 2000, 2500 };
+static const int ts990s_fsk_width[] = { 250, 300, 350, 400, 450, 500, 1000, 1500 };
+static const int ts990s_psk_width[] =
+    { 50, 80, 100, 150, 200, 250, 300, 350, 400, 450, 500, 600,
+      700, 800, 900, 1000, 1200, 1400, 1500, 1600, 1800, 2000, 2200,
+      2400, 2600, 2800, 3000 };
+
+static enum ts990s_filter_kind ts990s_filter_kind(rmode_t mode)
+{
+    if (mode == RIG_MODE_AM || mode == RIG_MODE_PKTAM) { return TS990S_FILTER_AM; }
+
+    if (mode == RIG_MODE_FM || mode == RIG_MODE_FMN || mode == RIG_MODE_PKTFM
+            || mode == RIG_MODE_PKTFMN) { return TS990S_FILTER_FM; }
+
+    if (mode == RIG_MODE_CW || mode == RIG_MODE_CWR) { return TS990S_FILTER_CW; }
+
+    if (mode == RIG_MODE_RTTY || mode == RIG_MODE_RTTYR) { return TS990S_FILTER_FSK; }
+
+    if (mode == RIG_MODE_PSK || mode == RIG_MODE_PSKR) { return TS990S_FILTER_PSK; }
+
+    return (mode == RIG_MODE_SSB || mode == RIG_MODE_LSB || mode == RIG_MODE_USB
+            || mode == RIG_MODE_PKTUSB || mode == RIG_MODE_PKTLSB
+            || mode == RIG_MODE_USBD1 || mode == RIG_MODE_USBD2
+            || mode == RIG_MODE_USBD3 || mode == RIG_MODE_LSBD1
+            || mode == RIG_MODE_LSBD2 || mode == RIG_MODE_LSBD3)
+           ? TS990S_FILTER_SSB : -1;
+}
+
+static int ts990s_filter_band(vfo_t vfo)
+{
+    return (vfo == RIG_VFO_B || vfo == RIG_VFO_SUB) ? 1 : 0;
+}
+
+static int ts990s_read_filter_id(RIG *rig, const char *command, vfo_t vfo,
+                                 int *id)
+{
+    char cmd[8];
+    char response[16];
+    char *end;
+    int retval;
+
+    SNPRINTF(cmd, sizeof(cmd), "%s%d", command, ts990s_filter_band(vfo));
+    retval = kenwood_transaction(rig, cmd, response, sizeof(response));
+
+    if (retval != RIG_OK) { return retval; }
+
+    if (strncmp(response, command, 2) != 0 || response[2] != cmd[2])
+    {
+        return -RIG_EPROTO;
+    }
+
+    *id = (int)strtol(response + 3, &end, 10);
+
+    if (end == response + 3 || *end != '\0') { return -RIG_EPROTO; }
+
+    return RIG_OK;
+}
+
+static int ts990s_set_filter_id(RIG *rig, const char *command, vfo_t vfo, int id)
+{
+    char cmd[16];
+    struct kenwood_priv_data *priv = STATE(rig)->priv;
+    int digits = priv->fw_rev_uint >= 120 ? 3 : 2;
+
+    SNPRINTF(cmd, sizeof(cmd), "%s%d%0*d", command, ts990s_filter_band(vfo), digits, id);
+    return kenwood_transaction(rig, cmd, NULL, 0);
+}
+
+static int ts990s_select_width(const int *values, size_t count, pbwidth_t width)
+{
+    size_t i;
+
+    for (i = 0; i < count; i++)
+    {
+        if (values[i] >= width) { return (int)i; }
+    }
+
+    return (int)(count - 1);
+}
+
+int ts990s_set_filter_width(RIG *rig, vfo_t vfo, rmode_t mode, pbwidth_t width)
+{
+    enum ts990s_filter_kind kind;
+
+    if (width == RIG_PASSBAND_NOCHANGE) { return RIG_OK; }
+
+    if (width == RIG_PASSBAND_NORMAL) { width = rig_passband_normal(rig, mode); }
+
+    if (width <= 0) { return -RIG_EINVAL; }
+
+    kind = ts990s_filter_kind(mode);
+
+    if (kind == TS990S_FILTER_CW)
+    {
+        return ts990s_set_filter_id(rig, "SL", vfo,
+                                    ts990s_select_width(ts990s_cw_width,
+                                            sizeof(ts990s_cw_width) / sizeof(int), width));
+    }
+
+    if (kind == TS990S_FILTER_FSK)
+    {
+        return ts990s_set_filter_id(rig, "SL", vfo,
+                                    ts990s_select_width(ts990s_fsk_width,
+                                            sizeof(ts990s_fsk_width) / sizeof(int), width));
+    }
+
+    if (kind == TS990S_FILTER_PSK)
+    {
+        return ts990s_set_filter_id(rig, "SL", vfo,
+                                    ts990s_select_width(ts990s_psk_width,
+                                            sizeof(ts990s_psk_width) / sizeof(int), width));
+    }
+
+    {
+        const int *high;
+        const int *low;
+        size_t high_count;
+        size_t low_count;
+        int low_id;
+        int target;
+        int retval;
+
+        switch (kind)
+        {
+        case TS990S_FILTER_AM:
+            high = ts990s_am_high;
+            high_count = sizeof(ts990s_am_high) / sizeof(int);
+            low = ts990s_am_low;
+            low_count = sizeof(ts990s_am_low) / sizeof(int);
+            break;
+
+        case TS990S_FILTER_FM:
+            high = ts990s_fm_high;
+            high_count = sizeof(ts990s_fm_high) / sizeof(int);
+            low = ts990s_fm_low;
+            low_count = sizeof(ts990s_fm_low) / sizeof(int);
+            break;
+
+        case TS990S_FILTER_SSB:
+            high = ts990s_ssb_high;
+            high_count = sizeof(ts990s_ssb_high) / sizeof(int);
+            low = ts990s_ssb_low;
+            low_count = sizeof(ts990s_ssb_low) / sizeof(int);
+            break;
+
+        default:
+            return -RIG_ENAVAIL;
+        }
+
+        retval = ts990s_read_filter_id(rig, "SL", vfo, &low_id);
+
+        if (retval != RIG_OK) { return retval; }
+
+        if (low_id < 0 || (size_t)low_id >= low_count) { return -RIG_EPROTO; }
+
+        target = low[low_id] + width;
+        return ts990s_set_filter_id(rig, "SH", vfo,
+                                     ts990s_select_width(high, high_count, target));
+    }
+}
+
+int ts990s_get_filter_width(RIG *rig, vfo_t vfo, rmode_t mode, pbwidth_t *width)
+{
+    enum ts990s_filter_kind kind;
+
+    if (!width) { return -RIG_EINVAL; }
+
+    kind = ts990s_filter_kind(mode);
+
+    if (kind == TS990S_FILTER_CW || kind == TS990S_FILTER_FSK || kind == TS990S_FILTER_PSK)
+    {
+        const int *values;
+        size_t count;
+        int id;
+        int retval = ts990s_read_filter_id(rig, "SL", vfo, &id);
+
+        if (retval != RIG_OK) { return retval; }
+
+        if (kind == TS990S_FILTER_CW)
+        {
+            values = ts990s_cw_width;
+            count = sizeof(ts990s_cw_width) / sizeof(int);
+        }
+        else if (kind == TS990S_FILTER_FSK)
+        {
+            values = ts990s_fsk_width;
+            count = sizeof(ts990s_fsk_width) / sizeof(int);
+        }
+        else
+        {
+            values = ts990s_psk_width;
+            count = sizeof(ts990s_psk_width) / sizeof(int);
+        }
+
+        if (id < 0 || (size_t)id >= count) { return -RIG_EPROTO; }
+
+        *width = values[id];
+        return RIG_OK;
+    }
+
+    {
+        const int *high;
+        const int *low;
+        size_t high_count;
+        size_t low_count;
+        int high_id;
+        int low_id;
+        int retval;
+
+        switch (kind)
+        {
+        case TS990S_FILTER_AM:
+            high = ts990s_am_high;
+            high_count = sizeof(ts990s_am_high) / sizeof(int);
+            low = ts990s_am_low;
+            low_count = sizeof(ts990s_am_low) / sizeof(int);
+            break;
+
+        case TS990S_FILTER_FM:
+            high = ts990s_fm_high;
+            high_count = sizeof(ts990s_fm_high) / sizeof(int);
+            low = ts990s_fm_low;
+            low_count = sizeof(ts990s_fm_low) / sizeof(int);
+            break;
+
+        case TS990S_FILTER_SSB:
+            high = ts990s_ssb_high;
+            high_count = sizeof(ts990s_ssb_high) / sizeof(int);
+            low = ts990s_ssb_low;
+            low_count = sizeof(ts990s_ssb_low) / sizeof(int);
+            break;
+
+        default:
+            return -RIG_ENAVAIL;
+        }
+
+        retval = ts990s_read_filter_id(rig, "SH", vfo, &high_id);
+
+        if (retval != RIG_OK) { return retval; }
+
+        retval = ts990s_read_filter_id(rig, "SL", vfo, &low_id);
+
+        if (retval != RIG_OK) { return retval; }
+
+        if (high_id < 0 || (size_t)high_id >= high_count
+                || low_id < 0 || (size_t)low_id >= low_count)
+        {
+            return -RIG_EPROTO;
+        }
+
+        *width = high[high_id] - low[low_id];
+        return RIG_OK;
+    }
+}
+
 static struct kenwood_priv_caps  ts990s_priv_caps  =
 {
     .cmdtrm =  EOM_KEN,
@@ -270,7 +553,8 @@ struct rig_caps ts990s_caps =
 
     /* mode/filter list, remember: order matters! */
     .filters =  {
-        {RIG_MODE_SSB | TS990S_FM_MODES, kHz(2.6)}, /* default normal */
+        {RIG_MODE_SSB, kHz(2.6)}, /* default normal */
+        {TS990S_FM_MODES, kHz(2.5)}, /* default normal */
         {RIG_MODE_SSB | TS990S_FM_MODES, kHz(2.0)}, /* default narrow -
                                                                                                  arbitrary choice */
         {RIG_MODE_SSB | TS990S_FM_MODES, kHz(3.2)}, /* default wide -

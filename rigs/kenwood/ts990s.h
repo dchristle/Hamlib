@@ -26,4 +26,9 @@
 
 extern struct rig_caps ts990s_caps;
 
+int ts990s_set_filter_width(RIG *rig, vfo_t vfo, rmode_t mode,
+                            pbwidth_t width);
+int ts990s_get_filter_width(RIG *rig, vfo_t vfo, rmode_t mode,
+                            pbwidth_t *width);
+
 #endif

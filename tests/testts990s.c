@@ -10,6 +10,7 @@
 
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
 #include <winsock2.h>
@@ -30,6 +31,10 @@ struct peer_state
     char mode_main;
     char mode_sub;
     char operating_band;
+    int sh_main;
+    int sh_sub;
+    int sl_main;
+    int sl_sub;
     int fail_next_mode;
     int fail_verify;
     int saw_data1_write;
@@ -122,6 +127,20 @@ static int handle_command(struct peer_state *peer, const char *command)
         return write_reply(peer->fd, reply);
     }
 
+    if (strcmp(command, "SH0;") == 0 || strcmp(command, "SH1;") == 0)
+    {
+        snprintf(reply, sizeof(reply), "SH%c%03d;", command[2],
+                 command[2] == '0' ? peer->sh_main : peer->sh_sub);
+        return write_reply(peer->fd, reply);
+    }
+
+    if (strcmp(command, "SL0;") == 0 || strcmp(command, "SL1;") == 0)
+    {
+        snprintf(reply, sizeof(reply), "SL%c%03d;", command[2],
+                 command[2] == '0' ? peer->sl_main : peer->sl_sub);
+        return write_reply(peer->fd, reply);
+    }
+
     if (strcmp(command, "ID;") == 0)
     {
         if (peer->fail_verify)
@@ -153,6 +172,20 @@ static int handle_command(struct peer_state *peer, const char *command)
         if (peer->operating_band == '0') { peer->mode_main = command[3]; }
         else { peer->mode_sub = command[3]; }
 
+        return 0;
+    }
+
+    if (strncmp(command, "SH", 2) == 0 && command[3] != ';')
+    {
+        if (command[2] == '0') { peer->sh_main = atoi(command + 3); }
+        else { peer->sh_sub = atoi(command + 3); }
+        return 0;
+    }
+
+    if (strncmp(command, "SL", 2) == 0 && command[3] != ';')
+    {
+        if (command[2] == '0') { peer->sl_main = atoi(command + 3); }
+        else { peer->sl_sub = atoi(command + 3); }
         return 0;
     }
 
@@ -195,15 +228,21 @@ static int open_test_connection(int sockets[2])
 
 static int run_case(const char *name, char mode_main, char mode_sub,
                     rmode_t request, pbwidth_t width, int fail_next_mode,
-                    int split, vfo_t target_vfo, int expected_retval, char expected_main,
+                    int split, vfo_t target_vfo, int expected_retval,
+                    rmode_t expected_mode, pbwidth_t expected_width,
+                    char expected_main,
                     char expected_sub, char expected_operating,
-                    int expect_data1_write)
+                    int expect_data1_write, int expected_sh_main,
+                    int expected_sl_main, int expected_sh_sub, int expected_sl_sub)
 {
     int sockets[2];
     pthread_t thread;
     struct peer_state peer;
     RIG *rig;
+    rmode_t actual_mode = RIG_MODE_NONE;
+    pbwidth_t actual_width = RIG_PASSBAND_NOCHANGE;
     int retval;
+    int getter_retval = RIG_OK;
 
     if (open_test_connection(sockets) != 0)
     {
@@ -216,6 +255,10 @@ static int run_case(const char *name, char mode_main, char mode_sub,
     peer.mode_main = mode_main;
     peer.mode_sub = mode_sub;
     peer.operating_band = '0';
+    peer.sh_main = 20;
+    peer.sh_sub = 20;
+    peer.sl_main = 0;
+    peer.sl_sub = 0;
     peer.fail_next_mode = fail_next_mode;
 
     if (pthread_create(&thread, NULL, run_peer, &peer) != 0)
@@ -268,6 +311,12 @@ static int run_case(const char *name, char mode_main, char mode_sub,
         retval = rig_set_mode(rig, target_vfo, request, width);
     }
 
+    if (expected_retval == RIG_OK)
+    {
+        vfo_t mode_vfo = split ? RIG_VFO_SUB : target_vfo;
+        getter_retval = rig_get_mode(rig, mode_vfo, &actual_mode, &actual_width);
+    }
+
     RIGPORT(rig)->fd = -1;
     rig_cleanup(rig);
     close_socket(sockets[0]);
@@ -275,14 +324,22 @@ static int run_case(const char *name, char mode_main, char mode_sub,
     close_socket(sockets[1]);
 
     if (retval != expected_retval
+            || getter_retval != RIG_OK
+            || (expected_retval == RIG_OK && (actual_mode != expected_mode
+                                               || actual_width != expected_width))
             || peer.status != 0
             || peer.mode_main != expected_main
             || peer.mode_sub != expected_sub
             || peer.operating_band != expected_operating
-            || peer.saw_data1_write != expect_data1_write)
+            || peer.saw_data1_write != expect_data1_write
+            || (expected_sh_main >= 0 && peer.sh_main != expected_sh_main)
+            || (expected_sl_main >= 0 && peer.sl_main != expected_sl_main)
+            || (expected_sh_sub >= 0 && peer.sh_sub != expected_sh_sub)
+            || (expected_sl_sub >= 0 && peer.sl_sub != expected_sl_sub))
     {
-        fprintf(stderr, "%s: result=%d mode=%c/%c operating=%c data1=%d\n",
-                name, retval, peer.mode_main, peer.mode_sub,
+        fprintf(stderr, "%s: result=%d getter=%d/%s/%ld mode=%c/%c operating=%c data1=%d\n",
+                name, retval, getter_retval, rig_strrmode(actual_mode),
+                (long)actual_width, peer.mode_main, peer.mode_sub,
                 peer.operating_band, peer.saw_data1_write);
         return 1;
     }
@@ -303,7 +360,8 @@ int main(void)
         RIG *rig = rig_init(RIG_MODEL_TS990S);
 
         if (rig == NULL || rig_passband_normal(rig, RIG_MODE_USBD2) != 2600
-                || rig_passband_normal(rig, RIG_MODE_LSBD3) != 2600)
+                || rig_passband_normal(rig, RIG_MODE_LSBD3) != 2600
+                || rig_passband_normal(rig, RIG_MODE_FM) != 2500)
         {
             fprintf(stderr, "TS-990S DATA profiles do not advertise a normal width\n");
             failed = 1;
@@ -314,16 +372,35 @@ int main(void)
 
     failed |= run_case("generic USB preserves USBD2", 'H', 'L',
                        RIG_MODE_PKTUSB, RIG_PASSBAND_NOCHANGE, 0, 0, RIG_VFO_MAIN,
-                       RIG_OK, 'H', 'L', '0', 0);
+                       RIG_OK, RIG_MODE_USBD2, 2600, 'H', 'L', '0', 0,
+                       20, 0, 20, 0);
     failed |= run_case("explicit USB width preserves USBD2", 'H', 'L',
                        RIG_MODE_PKTUSB, 2700, 0, 0, RIG_VFO_MAIN, RIG_OK,
-                       'H', 'L', '0', 0);
+                       RIG_MODE_USBD2, 2700, 'H', 'L', '0', 0, 21, 0, 20, 0);
     failed |= run_case("split generic USB preserves TX profile", 'H', 'H',
                        RIG_MODE_PKTUSB, RIG_PASSBAND_NOCHANGE, 0, 1, RIG_VFO_MAIN,
-                       RIG_OK, 'H', 'H', '0', 0);
+                       RIG_OK, RIG_MODE_USBD2, 2600, 'H', 'H', '0', 0,
+                       20, 0, 20, 0);
     failed |= run_case("mode error restores operating VFO", 'H', 'L',
                        RIG_MODE_USBD1, RIG_PASSBAND_NOCHANGE, 1, 0, RIG_VFO_SUB,
-                       -RIG_ETIMEOUT, 'H', 'L', '0', 1);
+                       -RIG_ETIMEOUT, RIG_MODE_NONE, RIG_PASSBAND_NOCHANGE,
+                       'H', 'L', '0', 1, 20, 0, 20, 0);
+    failed |= run_case("AM width uses high-cut table", '5', 'L', RIG_MODE_AM,
+                       3500, 0, 0, RIG_VFO_MAIN, RIG_OK, RIG_MODE_AM, 3500,
+                       '5', 'L', '0', 0,
+                       11, 0, 20, 0);
+    failed |= run_case("FM width uses high-cut table", '4', 'L', RIG_MODE_FM,
+                       2000, 0, 0, RIG_VFO_MAIN, RIG_OK, RIG_MODE_FM, 2000,
+                       '4', 'L', '0', 0,
+                       10, 0, 20, 0);
+    failed |= run_case("CW width uses width table", '3', 'L', RIG_MODE_CW,
+                       600, 0, 0, RIG_VFO_MAIN, RIG_OK, RIG_MODE_CW, 600,
+                       '3', 'L', '0', 0,
+                       20, 11, 20, 0);
+    failed |= run_case("RTTY width uses FSK table", '6', 'L', RIG_MODE_RTTY,
+                       1000, 0, 0, RIG_VFO_MAIN, RIG_OK, RIG_MODE_RTTY, 1000,
+                       '6', 'L', '0', 0,
+                       20, 6, 20, 0);
 
     return failed;
 #endif
