@@ -18,6 +18,7 @@
 #include "hamlib/rig.h"
 #include "hamlib/port.h"
 #include "hamlib/rig_state.h"
+#include "cache.h"
 #include "guohetec.h"
 
 #if defined(HAVE_SOCKETPAIR) && defined(HAVE_SYS_SOCKET_H)
@@ -156,6 +157,7 @@ struct echo_exchange
 {
     unsigned char request[9];
     unsigned char reply[9];
+    size_t reply_size;
 };
 
 struct echo_peer_case
@@ -236,6 +238,7 @@ static void prepare_echo_exchange(struct echo_exchange *exchange,
     exchange->request[7] = crc >> 8;
     exchange->request[8] = crc & 0xFF;
     memcpy(exchange->reply, exchange->request, sizeof(exchange->reply));
+    exchange->reply_size = sizeof(exchange->reply);
 }
 
 static void *run_echo_peer(void *arg)
@@ -251,7 +254,7 @@ static void *run_echo_peer(void *arg)
                 memcmp(request, test->exchanges[i].request,
                        sizeof(request)) != 0 ||
                 write_all(test->fd, test->exchanges[i].reply,
-                          sizeof(test->exchanges[i].reply)) != 0)
+                          test->exchanges[i].reply_size) != 0)
         {
             return NULL;
         }
@@ -486,6 +489,235 @@ static int test_q900_split_commands(void)
     return 0;
 }
 
+static int test_q900_ptt_commands(void)
+{
+    struct echo_exchange exchanges[2];
+    struct echo_peer_case test = {
+        .fd = -1,
+        .exchanges = exchanges,
+        .exchange_count = 2,
+        .follow_status = 1,
+        .status = -1
+    };
+    int sockets[2];
+    pthread_t thread;
+    RIG *rig = NULL;
+    ptt_t cached_ptt = RIG_PTT_OFF;
+    freq_t freq = 0;
+    int cache_ms;
+    int timeout_ms;
+    int on_ret = -1;
+    int off_ret = -1;
+    int freq_ret = -1;
+    int on_cache = 0;
+    int off_cache = 0;
+
+    prepare_echo_exchange(&exchanges[0], 0x07, 0);
+    prepare_echo_exchange(&exchanges[1], 0x07, 1);
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0)
+    {
+        perror("socketpair");
+        return 1;
+    }
+
+    test.fd = sockets[1];
+
+    if (pthread_create(&thread, NULL, run_echo_peer, &test) != 0)
+    {
+        close(sockets[0]);
+        close(sockets[1]);
+        return 1;
+    }
+
+    if (open_test_rig(RIG_MODEL_Q900, sockets[0], &rig) == 0)
+    {
+        on_ret = rig->caps->set_ptt(rig, RIG_VFO_A, RIG_PTT_ON);
+        rig_get_cache_ptt(rig, &cached_ptt, &cache_ms, &timeout_ms);
+        on_cache = cached_ptt == RIG_PTT_ON;
+        off_ret = rig->caps->set_ptt(rig, RIG_VFO_A, RIG_PTT_OFF);
+        rig_get_cache_ptt(rig, &cached_ptt, &cache_ms, &timeout_ms);
+        off_cache = cached_ptt == RIG_PTT_OFF;
+        freq_ret = rig->caps->get_freq(rig, RIG_VFO_A, &freq);
+        RIGPORT(rig)->fd = -1;
+        rig_cleanup(rig);
+    }
+
+    close(sockets[0]);
+    pthread_join(thread, NULL);
+    close(sockets[1]);
+
+    if (test.status != 0 || on_ret != RIG_OK || off_ret != RIG_OK ||
+            freq_ret != RIG_OK || !on_cache || !off_cache ||
+            freq != 21080000)
+    {
+        fprintf(stderr,
+                "Q900 PTT: ret=%d/%d/%d cache=%d/%d freq=%g peer=%d\n",
+                on_ret, off_ret, freq_ret, on_cache, off_cache,
+                freq, test.status);
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_q900_rejected_echoes(void)
+{
+    struct echo_exchange exchanges[7];
+    struct echo_peer_case test = {
+        .fd = -1,
+        .exchanges = exchanges,
+        .exchange_count = 7,
+        .follow_status = 0,
+        .status = -1
+    };
+    int sockets[2];
+    pthread_t thread;
+    RIG *rig = NULL;
+    split_t split = RIG_SPLIT_ON;
+    vfo_t tx_vfo = RIG_VFO_B;
+    ptt_t cached_ptt = RIG_PTT_ON;
+    int cache_ms;
+    int timeout_ms;
+    int split_ret = RIG_OK;
+    int ptt_ret = RIG_OK;
+    int invalid_split_ret = RIG_OK;
+    int invalid_ptt_ret = RIG_OK;
+    int write_ret = RIG_OK;
+    int split_write_ret = RIG_OK;
+    int cache_valid = 0;
+    uint16_t crc;
+
+    prepare_echo_exchange(&exchanges[0], 0x1C, 1);
+    exchanges[0].reply[8] ^= 1;
+    prepare_echo_exchange(&exchanges[1], 0x07, 0);
+    exchanges[1].reply[6] = 1;
+    crc = CRC16Check(&exchanges[1].reply[4], 3);
+    exchanges[1].reply[7] = crc >> 8;
+    exchanges[1].reply[8] = crc & 0xFF;
+    for (size_t i = 2; i < 7; i++)
+    {
+        prepare_echo_exchange(&exchanges[i], 0x07, 1);
+        exchanges[i].reply[8] ^= 1;
+    }
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0)
+    {
+        perror("socketpair");
+        return 1;
+    }
+
+    test.fd = sockets[1];
+
+    if (pthread_create(&thread, NULL, run_echo_peer, &test) != 0)
+    {
+        close(sockets[0]);
+        close(sockets[1]);
+        return 1;
+    }
+
+    if (open_test_rig(RIG_MODEL_Q900, sockets[0], &rig) == 0)
+    {
+        rig_set_cache_ptt(rig, RIG_PTT_OFF);
+        rig_set_cache_split(rig, RIG_SPLIT_OFF, RIG_VFO_A);
+        split_ret = rig->caps->set_split_vfo(rig, RIG_VFO_A,
+                                              RIG_SPLIT_ON, RIG_VFO_B);
+        ptt_ret = rig->caps->set_ptt(rig, RIG_VFO_A, RIG_PTT_ON);
+        invalid_split_ret = rig->caps->set_split_vfo(
+                                rig, RIG_VFO_A, (split_t)99, RIG_VFO_B);
+        invalid_ptt_ret = rig->caps->set_ptt(rig, RIG_VFO_A, (ptt_t)99);
+        RIGPORT(rig)->fd = -1;
+        write_ret = rig->caps->set_ptt(rig, RIG_VFO_A, RIG_PTT_ON);
+        split_write_ret = rig->caps->set_split_vfo(
+                              rig, RIG_VFO_A, RIG_SPLIT_ON, RIG_VFO_B);
+        rig->caps->get_split_vfo(rig, RIG_VFO_A, &split, &tx_vfo);
+        rig_get_cache_ptt(rig, &cached_ptt, &cache_ms, &timeout_ms);
+        cache_valid = split == RIG_SPLIT_OFF && tx_vfo == RIG_VFO_A &&
+                      cached_ptt == RIG_PTT_ON;
+        rig_cleanup(rig);
+    }
+
+    close(sockets[0]);
+    pthread_join(thread, NULL);
+    close(sockets[1]);
+
+    if (test.status != 0 || split_ret != -RIG_EPROTO ||
+            ptt_ret != -RIG_EPROTO || invalid_split_ret != -RIG_EINVAL ||
+            invalid_ptt_ret != -RIG_EINVAL || write_ret >= 0 ||
+            split_write_ret >= 0 || !cache_valid)
+    {
+        fprintf(stderr,
+                "Q900 rejection: ret=%d/%d/%d/%d/%d/%d cache=%d peer=%d\n",
+                split_ret, ptt_ret, invalid_split_ret, invalid_ptt_ret,
+                write_ret, split_write_ret, cache_valid, test.status);
+        return 1;
+    }
+
+    return 0;
+}
+
+static int test_q900_short_ptt_echo(void)
+{
+    struct echo_exchange exchanges[3];
+    struct echo_peer_case test = {
+        .fd = -1,
+        .exchanges = exchanges,
+        .exchange_count = 3,
+        .follow_status = 0,
+        .status = -1
+    };
+    int sockets[2];
+    pthread_t thread;
+    RIG *rig = NULL;
+    ptt_t cached_ptt = RIG_PTT_ON;
+    int cache_ms;
+    int timeout_ms;
+    int ret = RIG_OK;
+
+    prepare_echo_exchange(&exchanges[0], 0x07, 0);
+    exchanges[0].reply_size = sizeof(exchanges[0].reply) - 1;
+    prepare_echo_exchange(&exchanges[1], 0x07, 1);
+    exchanges[1].reply[8] ^= 1;
+    prepare_echo_exchange(&exchanges[2], 0x07, 1);
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0)
+    {
+        perror("socketpair");
+        return 1;
+    }
+
+    test.fd = sockets[1];
+
+    if (pthread_create(&thread, NULL, run_echo_peer, &test) != 0)
+    {
+        close(sockets[0]);
+        close(sockets[1]);
+        return 1;
+    }
+
+    if (open_test_rig(RIG_MODEL_Q900, sockets[0], &rig) == 0)
+    {
+        rig_set_cache_ptt(rig, RIG_PTT_OFF);
+        ret = rig->caps->set_ptt(rig, RIG_VFO_A, RIG_PTT_ON);
+        rig_get_cache_ptt(rig, &cached_ptt, &cache_ms, &timeout_ms);
+        RIGPORT(rig)->fd = -1;
+        rig_cleanup(rig);
+    }
+
+    close(sockets[0]);
+    pthread_join(thread, NULL);
+    close(sockets[1]);
+
+    if (test.status != 0 || ret >= 0 || cached_ptt != RIG_PTT_OFF)
+    {
+        fprintf(stderr, "Q900 short PTT echo: ret=%d cache=%d peer=%d\n",
+                ret, cached_ptt, test.status);
+        return 1;
+    }
+
+    return 0;
+}
+
 #endif
 
 int main(void)
@@ -499,7 +731,10 @@ int main(void)
     if (run_transaction_case("PMR-171", RIG_MODEL_PMR171) != 0 ||
             run_transaction_case("Q900", RIG_MODEL_Q900) != 0 ||
             test_cached_fallback() != 0 ||
-            test_q900_split_commands() != 0)
+            test_q900_split_commands() != 0 ||
+            test_q900_ptt_commands() != 0 ||
+            test_q900_rejected_echoes() != 0 ||
+            test_q900_short_ptt_echo() != 0)
     {
         return 1;
     }

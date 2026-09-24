@@ -334,29 +334,6 @@ static int q900_open(RIG *rig)
  
 /* ---------------------------------------------------------------------- */
  
- static int q900_send(RIG *rig, const unsigned char* buff, int len, unsigned char *reply, int rlen)
-{
-    hamlib_port_t *rp = RIGPORT(rig);
-    int retry = 5;
-    
-    while (retry > 0) {
-        rig_flush(rp);
-        write_block(rp, buff, len);
-        
-        int r = read_block(rp, reply, rlen);
-        if (r > 0) {
-            break;
-        }
-        
-        retry--;
-        hl_usleep(20 * 1000); 
-    }
-
-    return RIG_OK;
-}
-
-/* ---------------------------------------------------------------------- */
- 
 static int q900_get_freq(RIG *rig, vfo_t vfo, freq_t *freq)
 {
     struct guohetec_status status;
@@ -546,6 +523,28 @@ static int q900_exchange_cmd2(RIG *rig, unsigned char cmd,
 
     return RIG_OK;
 }
+
+static int q900_release_ptt(RIG *rig)
+{
+    int ret = RIG_OK;
+
+    for (int attempt = 0; attempt < 5; attempt++)
+    {
+        ret = q900_exchange_cmd2(rig, 0x07, 0x01);
+
+        if (ret == RIG_OK)
+        {
+            break;
+        }
+
+        if (attempt < 4)
+        {
+            hl_usleep(20 * 1000);
+        }
+    }
+
+    return ret;
+}
  
 
  
@@ -691,22 +690,33 @@ static int q900_exchange_cmd2(RIG *rig, unsigned char cmd,
  
 static int q900_set_ptt(RIG *rig, vfo_t vfo, ptt_t ptt)
 {
-    unsigned char cmd[9] = {
-        0xa5, 0xa5, 0xa5, 0xa5, 
-        0x04,                     
-        0x07,                     
-        (unsigned char)(ptt == RIG_PTT_ON ? 0x00 : 0x01), 
-        0x00, 0x00                
-    };
+    int ret;
 
-    uint16_t crc = CRC16Check(&cmd[4], 3);
-    cmd[7] = crc >> 8;
-    cmd[8] = crc & 0xff;
+    if (ptt != RIG_PTT_ON && ptt != RIG_PTT_OFF)
+    {
+        return -RIG_EINVAL;
+    }
 
-    unsigned char reply[9];
-    q900_send(rig, cmd, sizeof(cmd), reply, sizeof(reply));
+    if (RIGPORT(rig)->fd < 0)
+    {
+        return -RIG_EIO;
+    }
 
-    // Update cache
+    ret = ptt == RIG_PTT_ON ? q900_exchange_cmd2(rig, 0x07, 0x00) :
+          q900_release_ptt(rig);
+
+    if (ret != RIG_OK)
+    {
+        rig_set_cache_ptt(rig, RIG_PTT_ON);
+
+        if (ptt == RIG_PTT_ON && q900_release_ptt(rig) == RIG_OK)
+        {
+            rig_set_cache_ptt(rig, RIG_PTT_OFF);
+        }
+
+        return ret;
+    }
+
     rig_set_cache_ptt(rig, ptt);
 
     return RIG_OK;
