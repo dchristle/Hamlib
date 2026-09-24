@@ -152,6 +152,21 @@ struct peer_case
     int status;
 };
 
+struct echo_exchange
+{
+    unsigned char request[9];
+    unsigned char reply[9];
+};
+
+struct echo_peer_case
+{
+    int fd;
+    const struct echo_exchange *exchanges;
+    size_t exchange_count;
+    int follow_status;
+    int status;
+};
+
 static int read_all(int fd, unsigned char *buffer, size_t length)
 {
     size_t total = 0;
@@ -200,6 +215,55 @@ static void *run_peer(void *arg)
         {
             return NULL;
         }
+    }
+
+    test->status = 0;
+    return NULL;
+}
+
+static void prepare_echo_exchange(struct echo_exchange *exchange,
+                                  unsigned char command, unsigned char value)
+{
+    static const unsigned char frame[9] = {
+        0xA5, 0xA5, 0xA5, 0xA5, 0x04, 0, 0, 0, 0
+    };
+    uint16_t crc;
+
+    memcpy(exchange->request, frame, sizeof(frame));
+    exchange->request[5] = command;
+    exchange->request[6] = value;
+    crc = CRC16Check(&exchange->request[4], 3);
+    exchange->request[7] = crc >> 8;
+    exchange->request[8] = crc & 0xFF;
+    memcpy(exchange->reply, exchange->request, sizeof(exchange->reply));
+}
+
+static void *run_echo_peer(void *arg)
+{
+    struct echo_peer_case *test = arg;
+    unsigned char request[9];
+
+    test->status = -1;
+
+    for (size_t i = 0; i < test->exchange_count; i++)
+    {
+        if (read_all(test->fd, request, sizeof(request)) != 0 ||
+                memcmp(request, test->exchanges[i].request,
+                       sizeof(request)) != 0 ||
+                write_all(test->fd, test->exchanges[i].reply,
+                          sizeof(test->exchanges[i].reply)) != 0)
+        {
+            return NULL;
+        }
+    }
+
+    if (test->follow_status &&
+            (read_all(test->fd, request, sizeof(status_request)) != 0 ||
+             memcmp(request, status_request, sizeof(status_request)) != 0 ||
+             write_all(test->fd, captured_firmware_3_5_status,
+                       sizeof(captured_firmware_3_5_status)) != 0))
+    {
+        return NULL;
     }
 
     test->status = 0;
@@ -347,6 +411,81 @@ static int test_cached_fallback(void)
     return 0;
 }
 
+static int test_q900_split_commands(void)
+{
+    struct echo_exchange exchanges[2];
+    struct echo_peer_case test = {
+        .fd = -1,
+        .exchanges = exchanges,
+        .exchange_count = 2,
+        .follow_status = 1,
+        .status = -1
+    };
+    int sockets[2];
+    pthread_t thread;
+    RIG *rig = NULL;
+    split_t split = RIG_SPLIT_OFF;
+    vfo_t tx_vfo = RIG_VFO_A;
+    freq_t freq = 0;
+    int on_ret = -1;
+    int off_ret = -1;
+    int freq_ret = -1;
+    int on_cache = 0;
+    int off_cache = 0;
+    int no_extra_ack = 0;
+
+    prepare_echo_exchange(&exchanges[0], 0x1C, 1);
+    prepare_echo_exchange(&exchanges[1], 0x1C, 0);
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0)
+    {
+        perror("socketpair");
+        return 1;
+    }
+
+    test.fd = sockets[1];
+
+    if (pthread_create(&thread, NULL, run_echo_peer, &test) != 0)
+    {
+        close(sockets[0]);
+        close(sockets[1]);
+        return 1;
+    }
+
+    if (open_test_rig(RIG_MODEL_Q900, sockets[0], &rig) == 0)
+    {
+        on_ret = rig->caps->set_split_vfo(rig, RIG_VFO_A,
+                                           RIG_SPLIT_ON, RIG_VFO_B);
+        rig->caps->get_split_vfo(rig, RIG_VFO_A, &split, &tx_vfo);
+        on_cache = split == RIG_SPLIT_ON && tx_vfo == RIG_VFO_B;
+        off_ret = rig->caps->set_split_vfo(rig, RIG_VFO_A,
+                                            RIG_SPLIT_OFF, RIG_VFO_A);
+        rig->caps->get_split_vfo(rig, RIG_VFO_A, &split, &tx_vfo);
+        off_cache = split == RIG_SPLIT_OFF && tx_vfo == RIG_VFO_A;
+        no_extra_ack = RIGPORT(rig)->post_write_delay == 0;
+        freq_ret = rig->caps->get_freq(rig, RIG_VFO_A, &freq);
+        RIGPORT(rig)->fd = -1;
+        rig_cleanup(rig);
+    }
+
+    close(sockets[0]);
+    pthread_join(thread, NULL);
+    close(sockets[1]);
+
+    if (test.status != 0 || on_ret != RIG_OK || off_ret != RIG_OK ||
+            freq_ret != RIG_OK || !on_cache || !off_cache ||
+            !no_extra_ack || freq != 21080000)
+    {
+        fprintf(stderr,
+                "Q900 split: ret=%d/%d/%d cache=%d/%d ack=%d freq=%g peer=%d\n",
+                on_ret, off_ret, freq_ret, on_cache, off_cache,
+                no_extra_ack, freq, test.status);
+        return 1;
+    }
+
+    return 0;
+}
+
 #endif
 
 int main(void)
@@ -359,7 +498,8 @@ int main(void)
 
     if (run_transaction_case("PMR-171", RIG_MODEL_PMR171) != 0 ||
             run_transaction_case("Q900", RIG_MODEL_Q900) != 0 ||
-            test_cached_fallback() != 0)
+            test_cached_fallback() != 0 ||
+            test_q900_split_commands() != 0)
     {
         return 1;
     }

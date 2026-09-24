@@ -21,6 +21,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef HAVE_SYS_TIME_H
 #include <sys/time.h>
@@ -504,6 +505,47 @@ static int q900_get_ptt(RIG *rig, vfo_t vfo, ptt_t *ptt)
      }
      return q900_read_ack(rig);
  }
+
+static int q900_exchange_cmd2(RIG *rig, unsigned char cmd,
+                              unsigned char value)
+{
+    unsigned char request[9] = {
+        0xa5, 0xa5, 0xa5, 0xa5, 0x04, cmd, value, 0x00, 0x00
+    };
+    unsigned char reply[sizeof(request)];
+    hamlib_port_t *rp = RIGPORT(rig);
+    uint16_t crc = CRC16Check(&request[4], 3);
+    int ret;
+
+    request[7] = crc >> 8;
+    request[8] = crc & 0xff;
+
+    rig_flush(rp);
+    ret = write_block(rp, request, sizeof(request));
+
+    if (ret != RIG_OK)
+    {
+        return ret;
+    }
+
+    ret = guohetec_read_response(rig, reply, sizeof(reply), __func__);
+
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    if (ret != (int)sizeof(reply) ||
+            memcmp(reply, request, sizeof(reply)) != 0)
+    {
+        rig_debug(RIG_DEBUG_ERR,
+                  "%s: Unexpected response to command 0x%02x\n",
+                  __func__, cmd);
+        return -RIG_EPROTO;
+    }
+
+    return RIG_OK;
+}
  
 
  
@@ -701,21 +743,28 @@ static int q900_set_ptt(RIG *rig, vfo_t vfo, ptt_t ptt)
  static int q900_set_split_vfo(RIG *rig, vfo_t vfo, split_t split,
                                  vfo_t tx_vfo)
  {
+     int ret;
+
      rig_debug(RIG_DEBUG_VERBOSE, "%s: called\n", __func__);
  
      switch (split)
      {
      case RIG_SPLIT_ON:
-         q900_send_cmd2(rig, 0x07, 0x1c, 1);
+         ret = q900_exchange_cmd2(rig, 0x1c, 0x01);
          break;
  
      case RIG_SPLIT_OFF:
-         q900_send_cmd2(rig, 0x07, 0x1c, 0);
+         ret = q900_exchange_cmd2(rig, 0x1c, 0x00);
          break;
          
      default:
          rig_debug(RIG_DEBUG_ERR, "%s: unsupported split value %d\n", __func__, split);
-         break;
+         return -RIG_EINVAL;
+     }
+
+     if (ret != RIG_OK)
+     {
+         return ret;
      }
  
      rig_set_cache_split(rig, split, tx_vfo);
