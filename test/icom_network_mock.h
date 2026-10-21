@@ -156,6 +156,7 @@ struct mock_server
     /* Datagrams received on any socket, silent or not. */
     HAMLIB_ATOMIC int rx_packets;
     HAMLIB_ATOMIC int audio_tx_bytes;
+    HAMLIB_ATOMIC int audio_tx_sequence;
 
     /* Scripted audio. Setting audio_script_go sends audio_script_count data
      * packets, in the order listed, with the sequence numbers in audio_script;
@@ -188,5 +189,6 @@ extern const uint8_t mock_audio[16];
 uint16_t bind_ephemeral(int *out_fd);
 void mock_start(struct mock_server *m);
 void mock_stop(struct mock_server *m);
+void mock_request_audio_replay(struct mock_server *m, uint16_t sequence);
 
 #endif /* _ICOM_NETWORK_MOCK_H */

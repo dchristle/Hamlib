@@ -433,7 +433,11 @@ static int icom_network_session_send_raw(
     struct icom_network_session_socket *sock, const uint8_t *packet,
     size_t length)
 {
+#ifdef MSG_DONTWAIT
+    ssize_t w = send(sock->fd, packet, length, MSG_DONTWAIT);
+#else
     ssize_t w = send(sock->fd, packet, length, 0);
+#endif
 
     if (w == (ssize_t)length) { return RIG_OK; }
 
@@ -2693,6 +2697,13 @@ void icom_network_audio_stop(struct icom_network_session *s,
                      : &s->audio_tx_users;
 
         if (*users > 0) { (*users)--; }
+        if (user == ICOM_NETWORK_AUDIO_TX && s->audio_tx_users == 0)
+        {
+            /* A later TX attempt must not replay audio from the previous one. */
+            pthread_mutex_lock(&s->audio.lock);
+            icom_network_txbuf_init(&s->audio.txbuf);
+            pthread_mutex_unlock(&s->audio.lock);
+        }
 
         /* The last one out stops the flow, so the radio does not stream to a
          * session nobody reads. */

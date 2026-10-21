@@ -43,6 +43,8 @@
 #include "hamlib/riglist.h"
 #include "icom.h"
 #include "icom_defs.h"
+#include "stream.h"
+#include "cache.h"
 
 /* Open the IC-7610 network model against the mock radio on loopback. Returns
  * NULL if the open failed, having cleaned up. */
@@ -1449,6 +1451,135 @@ void test_second_rx_stream_refused(void)
 }
 
 
+void test_tx_reopen_discards_replay_history(void)
+{
+    struct mock_server mock;
+    mock_start(&mock);
+    RIG *rig = open_against_mock(&mock, NULL);
+    TEST_ASSERT(rig != NULL);
+    rig_stream_t *rx = NULL, *tx = NULL;
+    TEST_ASSERT(stream_open(rig, RIG_STREAM_TYPE_AUDIO_RX,
+                            RIG_STREAM_FORMAT_PCM_S16, 48000, 1, &rx) == RIG_OK);
+    TEST_ASSERT(stream_open(rig, RIG_STREAM_TYPE_AUDIO_TX,
+                            RIG_STREAM_FORMAT_PCM_S16, 48000, 1, &tx) == RIG_OK);
+    int16_t frame[960] = { 1 };
+    size_t written = 0;
+    TEST_CHECK(rig_stream_write(rig, tx, frame, sizeof(frame), &written,
+                               20, NULL) == RIG_OK);
+    TEST_CHECK(rig_stream_drain(rig, tx, 1000) == RIG_OK);
+    for (int i = 0; i < 100 && mock.audio_tx_bytes < 1920; ++i) { usleep(1000); }
+    TEST_ASSERT(mock.audio_tx_bytes == 1920);
+    uint16_t sequence = (uint16_t)mock.audio_tx_sequence;
+    mock_request_audio_replay(&mock, sequence);
+    for (int i = 0; i < 100 && mock.audio_tx_bytes == 1920; ++i) { usleep(1000); }
+    TEST_ASSERT(mock.audio_tx_bytes > 1920);
+    TEST_CHECK(rig_stream_close(rig, tx) == RIG_OK);
+    TEST_ASSERT(stream_open(rig, RIG_STREAM_TYPE_AUDIO_TX,
+                            RIG_STREAM_FORMAT_PCM_S16, 48000, 1, &tx) == RIG_OK);
+    int before = mock.audio_tx_bytes;
+    mock_request_audio_replay(&mock, sequence);
+    usleep(120 * 1000);
+    TEST_CHECK(mock.audio_tx_bytes == before);
+    rig_stream_close(rig, tx);
+    rig_stream_close(rig, rx);
+    rig_close(rig);
+    rig_cleanup(rig);
+    mock_stop(&mock);
+}
+
+struct tx_close_context
+{
+    RIG *rig;
+    rig_stream_t *stream;
+    int result;
+};
+
+static void *close_tx_stream(void *arg)
+{
+    struct tx_close_context *ctx = arg;
+    ctx->result = rig_stream_close(ctx->rig, ctx->stream);
+    return NULL;
+}
+
+void test_tx_close_discards_partial_frame(void)
+{
+    struct mock_server mock;
+    mock_start(&mock);
+    RIG *rig = open_against_mock(&mock, NULL);
+    TEST_ASSERT(rig != NULL);
+    for (int attempt = 0; attempt < 8; ++attempt)
+    {
+        rig_stream_t *tx = NULL;
+        TEST_ASSERT(stream_open(rig, RIG_STREAM_TYPE_AUDIO_TX,
+                                RIG_STREAM_FORMAT_PCM_S16, 48000, 1, &tx) == RIG_OK);
+        int16_t sample = 1000;
+        size_t written = 0;
+        TEST_CHECK(rig_stream_write(rig, tx, &sample, sizeof(sample), &written,
+                                   20, NULL) == RIG_OK);
+        TEST_CHECK(written == sizeof(sample));
+        usleep(20 * 1000);
+        struct rig_stream_state *state = STATE(rig)->stream_state;
+        pthread_mutex_lock(&state->stream_mutex);
+        tx->in_use++;
+        pthread_mutex_unlock(&state->stream_mutex);
+        struct tx_close_context ctx = { rig, tx, -999 };
+        pthread_t thread;
+        TEST_ASSERT(pthread_create(&thread, NULL, close_tx_stream, &ctx) == 0);
+        int closing = 0;
+        for (int i = 0; i < 100 && !closing; ++i)
+        {
+            pthread_mutex_lock(&tx->ringbuf.lock);
+            closing = tx->ringbuf.closing;
+            pthread_mutex_unlock(&tx->ringbuf.lock);
+            if (!closing) { usleep(1000); }
+        }
+        TEST_CHECK(closing);
+        /* Keep teardown before its backend hook while the worker wakes. */
+        usleep(20 * 1000);
+        TEST_CHECK(mock.audio_tx_bytes == 0);
+        pthread_mutex_lock(&state->stream_mutex);
+        tx->in_use--;
+        pthread_cond_broadcast(&state->stream_idle);
+        pthread_mutex_unlock(&state->stream_mutex);
+        pthread_join(thread, NULL);
+        TEST_CHECK(ctx.result == RIG_OK);
+    }
+    usleep(120 * 1000);
+    TEST_CHECK(mock.audio_tx_bytes == 0);
+    rig_close(rig);
+    rig_cleanup(rig);
+    mock_stop(&mock);
+}
+
+void test_tx_failure_discards_partial_frame(void)
+{
+    struct mock_server mock;
+    mock_start(&mock);
+    RIG *rig = open_against_mock(&mock, NULL);
+    TEST_ASSERT(rig != NULL);
+    for (int attempt = 0; attempt < 2; ++attempt)
+    {
+        rig_stream_t *tx = NULL;
+        TEST_ASSERT(stream_open(rig, RIG_STREAM_TYPE_AUDIO_TX,
+                                RIG_STREAM_FORMAT_PCM_S16, 48000, 1, &tx) == RIG_OK);
+        int16_t sample = 1000;
+        size_t written = 0;
+        TEST_CHECK(rig_stream_write(rig, tx, &sample, sizeof(sample), &written,
+                                   20, NULL) == RIG_OK);
+        TEST_CHECK(written == sizeof(sample));
+        usleep(20 * 1000);
+        stream_mark_failed(tx, RIG_COMM_REASON_SOCKET_ERROR);
+        usleep(120 * 1000);
+        TEST_CHECK(rig_stream_drain(rig, tx, 20) == -RIG_EIO);
+        TEST_CHECK(rig_stream_close(rig, tx) == RIG_OK);
+    }
+    usleep(120 * 1000);
+    TEST_CHECK(mock.audio_tx_bytes == 0);
+    rig_close(rig);
+    rig_cleanup(rig);
+    mock_stop(&mock);
+}
+
 void test_tx_drain_includes_partial_frame(void)
 {
     struct mock_server mock;
@@ -1478,6 +1609,9 @@ void test_tx_drain_includes_partial_frame(void)
 
 TEST_LIST =
 {
+    { "tx_reopen_discards_replay_history", test_tx_reopen_discards_replay_history },
+    { "tx_failure_discards_partial_frame", test_tx_failure_discards_partial_frame },
+    { "tx_close_discards_partial_frame", test_tx_close_discards_partial_frame },
     { "tx_drain_includes_partial_frame", test_tx_drain_includes_partial_frame },
     { "rig_open_close",            test_stream_rig_open_close },
     { "open_close_each_type",      test_stream_open_close_each_type },

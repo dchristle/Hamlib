@@ -580,6 +580,15 @@ static void *icom_network_rx_thread(void *arg)
     return NULL;
 }
 
+static int icom_network_tx_stopped(struct icom_network_stream_state *st)
+{
+    pthread_mutex_lock(&st->stream->ringbuf.lock);
+    int stopped = !st->running || st->stream->ringbuf.closing
+                  || st->stream->ringbuf.failed;
+    pthread_mutex_unlock(&st->stream->ringbuf.lock);
+    return stopped;
+}
+
 /* Fill one wire frame from the ring, padding a genuine underrun with silence.
  * Returns the bytes gathered, which is 0 when the producer had nothing at all. */
 static size_t icom_network_tx_fill_frame(struct icom_network_stream_state *st,
@@ -588,7 +597,7 @@ static size_t icom_network_tx_fill_frame(struct icom_network_stream_state *st,
     struct rig_stream *stream = st->stream;
     size_t got = 0;
 
-    while (got < frame_bytes && st->running)
+    while (got < frame_bytes && !icom_network_tx_stopped(st))
     {
         size_t n = stream_ringbuf_read(&stream->ringbuf, st->pcm_buffer + got,
                                        frame_bytes - got, 100);
@@ -601,7 +610,8 @@ static size_t icom_network_tx_fill_frame(struct icom_network_stream_state *st,
     /* A partial frame because the stream is closing is not an underrun: the
      * producer did not stall, the loop was told to stop. Padding and warning
      * about it would report a fault on every clean close. */
-    if (got == 0 || got >= frame_bytes || !st->running) { return got; }
+    if (icom_network_tx_stopped(st)) { return 0; }
+    if (got == 0 || got >= frame_bytes) { return got; }
 
     rig_debug(RIG_DEBUG_WARN,
               "%s: TX underrun, padded %zu of %zu bytes with silence\n",
@@ -644,7 +654,7 @@ static size_t icom_network_tx_encode(struct icom_network_stream_state *st,
 
 /* Send one wire frame as max-payload packets (a 1920-byte LPCM16 frame travels
  * as 1364 + 556). */
-static void icom_network_tx_send_fragments(struct icom_network_stream_state *st,
+static int icom_network_tx_send_fragments(struct icom_network_stream_state *st,
         const uint8_t *wire, size_t length)
 {
     size_t off = 0;
@@ -658,8 +668,18 @@ static void icom_network_tx_send_fragments(struct icom_network_stream_state *st,
             chunk = ICOM_NETWORK_AUDIO_MAX_PAYLOAD;
         }
 
-        if (icom_network_audio_send(st->sess, st->generation, wire + off,
-                                    chunk) < 0)
+        /* Serialize packet admission with close marking the ring terminal. */
+        pthread_mutex_lock(&st->stream->ringbuf.lock);
+        if (!st->running || st->stream->ringbuf.closing
+                || st->stream->ringbuf.failed)
+        {
+            pthread_mutex_unlock(&st->stream->ringbuf.lock);
+            return -RIG_ENAVAIL;
+        }
+        int sent = icom_network_audio_send(st->sess, st->generation,
+                                           wire + off, chunk);
+        pthread_mutex_unlock(&st->stream->ringbuf.lock);
+        if (sent < 0)
         {
             /* Logged once: this runs per wire frame, so a persistent fault
              * would otherwise flood the log. The total is reported when the
@@ -671,10 +691,12 @@ static void icom_network_tx_send_fragments(struct icom_network_stream_state *st,
 
             st->tx_send_errors++;
             stream_mark_failed(st->stream, RIG_COMM_REASON_SOCKET_ERROR);
+            return -RIG_EIO;
         }
 
         off += chunk;
     }
+    return RIG_OK;
 }
 
 /* TX thread: pull one frame from the ring, encode it, and put it on the wire.
@@ -699,7 +721,7 @@ static void *icom_network_tx_thread(void *arg)
 
         got = icom_network_tx_fill_frame(st, frame_bytes);
 
-        if (!st->running) { break; }
+        if (icom_network_tx_stopped(st)) { break; }
 
         if (got == 0) { continue; }  /* nothing produced; the ping keeps it up */
 
@@ -707,7 +729,8 @@ static void *icom_network_tx_thread(void *arg)
 
         if (enc_bytes > 0)
         {
-            icom_network_tx_send_fragments(st, wire, enc_bytes);
+            if (icom_network_tx_send_fragments(st, wire, enc_bytes) != RIG_OK)
+            { break; }
             st->tx_completed_bytes += got;
         }
         else

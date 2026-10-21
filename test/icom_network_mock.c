@@ -687,6 +687,7 @@ static void mock_service_audio(struct mock_server *m, uint8_t *buf, int n,
         struct icom_network_packet_audio audio;
         if (icom_network_packet_parse_audio(buf, (size_t)n, &audio) == RIG_OK)
         {
+            m->audio_tx_sequence = icom_network_get_le16(buf + ICOM_NETWORK_OFF_SEQUENCE);
             m->audio_tx_bytes += audio.payload_length;
         }
         return;
@@ -841,4 +842,16 @@ void mock_stop(struct mock_server *m)
     if (m->civ_fd >= 0) { socket_close(m->civ_fd); }
 
     socket_close(m->audio_fd);
+}
+
+void mock_request_audio_replay(struct mock_server *m, uint16_t sequence)
+{
+    uint8_t packet[64];
+    int length = icom_network_packet_build_retransmit(packet, sizeof(packet),
+        &sequence, 1, MOCK_SERVER_ID, m->audio_client_id);
+    if (length > 0)
+    {
+        sendto(m->audio_fd, packet, (size_t)length, 0,
+               (struct sockaddr *)&m->audio_peer, m->audio_peer_length);
+    }
 }
