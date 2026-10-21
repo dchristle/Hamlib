@@ -657,8 +657,62 @@ void test_comm_reason_strings(void)
     TEST_CHECK(strcmp(rig_strcommreason(0x99), "") == 0);
 }
 
+static void check_control_type_is_instance_local(const char *name,
+        const char *const *values, size_t count)
+{
+    RIG *configured = rig_init(RIG_MODEL_IC9700NET);
+    RIG *existing = rig_init(RIG_MODEL_IC9700NET);
+    TEST_ASSERT(configured != NULL && existing != NULL);
+    token_t token = rig_token_lookup(configured, name);
+    TEST_ASSERT(token != RIG_CONF_END);
+    char original[64], actual[64];
+    TEST_ASSERT(rig_get_conf2(configured, token, original, sizeof(original)) == RIG_OK);
+    ptt_type_t default_ptt = configured->caps->ptt_type;
+    dcd_type_t default_dcd = configured->caps->dcd_type;
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        TEST_ASSERT(rig_set_conf(configured, token, values[i]) == RIG_OK);
+        TEST_CHECK(rig_get_conf2(configured, token, actual, sizeof(actual)) == RIG_OK);
+        TEST_CHECK(strcmp(actual, values[i]) == 0);
+        TEST_CHECK(configured->caps->ptt_type == default_ptt);
+        TEST_CHECK(configured->caps->dcd_type == default_dcd);
+        TEST_CHECK(rig_get_caps_int(RIG_MODEL_IC9700NET, RIG_CAPS_PTT_TYPE) == default_ptt);
+        TEST_CHECK(rig_get_conf2(existing, token, actual, sizeof(actual)) == RIG_OK);
+        TEST_CHECK(strcmp(actual, original) == 0);
+
+        RIG *subsequent = rig_init(RIG_MODEL_IC9700NET);
+        TEST_ASSERT(subsequent != NULL);
+        TEST_CHECK(rig_get_conf2(subsequent, token, actual, sizeof(actual)) == RIG_OK);
+        TEST_CHECK_(strcmp(actual, original) == 0,
+                    "%s override %s changed a later rig default to %s", name, values[i], actual);
+        rig_cleanup(subsequent);
+        TEST_ASSERT(rig_set_conf(configured, token, original) == RIG_OK);
+    }
+    rig_cleanup(configured);
+    rig_cleanup(existing);
+}
+
+void test_ptt_override_is_instance_local(void)
+{
+    const char *values[] = { "None", "DTR", "RTS", "Parallel", "CM108",
+                            "GPIO", "GPION", "RIG", "RIGMICDATA" };
+    check_control_type_is_instance_local("ptt_type", values,
+                                          sizeof(values) / sizeof(values[0]));
+}
+
+void test_dcd_override_is_instance_local(void)
+{
+    const char *values[] = { "None", "DSR", "CTS", "CD", "Parallel", "CM108",
+                            "GPIO", "GPION", "RIG" };
+    check_control_type_is_instance_local("dcd_type", values,
+                                          sizeof(values) / sizeof(values[0]));
+}
+
 TEST_LIST =
 {
+    { "ptt_override_is_instance_local", test_ptt_override_is_instance_local },
+    { "dcd_override_is_instance_local", test_dcd_override_is_instance_local },
     { "defaults_after_init",          test_defaults_after_init },
     { "codec_index_roundtrip",        test_codec_index_roundtrip },
     { "adpcm_rejected",               test_adpcm_rejected },
