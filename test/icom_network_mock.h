@@ -155,6 +155,7 @@ struct mock_server
     HAMLIB_ATOMIC int close_civ;
     /* Datagrams received on any socket, silent or not. */
     HAMLIB_ATOMIC int rx_packets;
+    HAMLIB_ATOMIC int audio_tx_bytes;
 
     /* Scripted audio. Setting audio_script_go sends audio_script_count data
      * packets, in the order listed, with the sequence numbers in audio_script;

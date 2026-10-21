@@ -1449,8 +1449,36 @@ void test_second_rx_stream_refused(void)
 }
 
 
+void test_tx_drain_includes_partial_frame(void)
+{
+    struct mock_server mock;
+    mock_start(&mock);
+    RIG *rig = open_against_mock(&mock, NULL);
+    TEST_ASSERT(rig != NULL);
+    rig_stream_t *tx = NULL;
+    TEST_ASSERT(stream_open(rig, RIG_STREAM_TYPE_AUDIO_TX,
+                            RIG_STREAM_FORMAT_PCM_S16, 48000, 1, &tx) == RIG_OK);
+    int16_t sample = 1000;
+    size_t written = 0;
+    TEST_CHECK(rig_stream_write(rig, tx, &sample, sizeof(sample), &written,
+                               20, NULL) == RIG_OK);
+    TEST_CHECK(written == sizeof(sample));
+    /* The worker holds an incomplete frame after emptying the host ring. */
+    usleep(20 * 1000);
+    TEST_CHECK(rig_stream_drain(rig, tx, 0) == -RIG_ETIMEOUT);
+    TEST_CHECK(rig_stream_drain(rig, tx, 1000) == RIG_OK);
+    for (int i = 0; i < 100 && mock.audio_tx_bytes < 1920; ++i)
+    { usleep(1000); }
+    TEST_CHECK(mock.audio_tx_bytes == 1920);
+    rig_stream_close(rig, tx);
+    rig_close(rig);
+    rig_cleanup(rig);
+    mock_stop(&mock);
+}
+
 TEST_LIST =
 {
+    { "tx_drain_includes_partial_frame", test_tx_drain_includes_partial_frame },
     { "rig_open_close",            test_stream_rig_open_close },
     { "open_close_each_type",      test_stream_open_close_each_type },
     { "reopen",                    test_stream_reopen },

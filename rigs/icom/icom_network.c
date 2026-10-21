@@ -264,6 +264,7 @@ struct icom_network_stream_state
     struct rig_audio_codec_state *codec;
     pthread_t thread;
     HAMLIB_ATOMIC int running;  /* thread stop flag; read by the stream thread */
+    HAMLIB_ATOMIC uint64_t tx_completed_bytes;
     unsigned tx_send_errors;  /* failed wire sends; first one is logged */
     int thread_started;
     enum icom_network_audio_user audio_user;
@@ -610,7 +611,7 @@ static size_t icom_network_tx_fill_frame(struct icom_network_stream_state *st,
      * negative, i.e. a click at every underrun. */
     memset(st->pcm_buffer + got, st->silence_fill, frame_bytes - got);
 
-    return frame_bytes;
+    return got;
 }
 
 /* Encode one frame into what goes on the wire. Returns the wire length and
@@ -669,6 +670,7 @@ static void icom_network_tx_send_fragments(struct icom_network_stream_state *st,
             }
 
             st->tx_send_errors++;
+            stream_mark_failed(st->stream, RIG_COMM_REASON_SOCKET_ERROR);
         }
 
         off += chunk;
@@ -706,6 +708,12 @@ static void *icom_network_tx_thread(void *arg)
         if (enc_bytes > 0)
         {
             icom_network_tx_send_fragments(st, wire, enc_bytes);
+            st->tx_completed_bytes += got;
+        }
+        else
+        {
+            stream_mark_failed(st->stream, RIG_COMM_REASON_NONE);
+            break;
         }
     }
 
@@ -956,6 +964,39 @@ static int icom_network_stream_open(RIG *rig, struct rig_stream *stream)
     return RIG_OK;
 }
 
+/* Completion means all accepted PCM reached the UDP sender, not that the
+ * radio acknowledged playout. The caller must allow the radio buffer tail. */
+static int icom_network_stream_drain(RIG *rig, struct rig_stream *stream,
+                                      int timeout_ms)
+{
+    (void)rig;
+    struct icom_network_stream_state *st = stream->backend_priv;
+    if (!st || stream_type_is_rx(stream->type)) { return RIG_OK; }
+    pthread_mutex_lock(&stream->ringbuf.lock);
+    uint64_t target = stream->ringbuf.write_total;
+    pthread_mutex_unlock(&stream->ringbuf.lock);
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;)
+    {
+        pthread_mutex_lock(&stream->ringbuf.lock);
+        int closing = stream->ringbuf.closing;
+        int failed = stream->ringbuf.failed;
+        pthread_mutex_unlock(&stream->ringbuf.lock);
+        if (closing || !st->running) { return -RIG_ENAVAIL; }
+        if (failed || icom_network_stream_ended(st)) { return -RIG_EIO; }
+        if (st->tx_completed_bytes >= target) { return RIG_OK; }
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000
+                          + (now.tv_nsec - start.tv_nsec) / 1000000;
+        if (timeout_ms >= 0 && elapsed_ms >= timeout_ms)
+        { return -RIG_ETIMEOUT; }
+        struct timespec pause = { 0, 1000000 };
+        nanosleep(&pause, NULL);
+    }
+}
+
 static int icom_network_stream_close(RIG *rig, struct rig_stream *stream)
 {
     struct icom_network_stream_state *st =
@@ -1145,6 +1186,7 @@ void icom_network_build_caps(struct rig_caps *out,
     out->get_conf = icom_network_get_conf;
     out->stream_open = icom_network_stream_open;
     out->stream_close = icom_network_stream_close;
+    out->stream_drain = icom_network_stream_drain;
 
     {
         /* rig_caps.stream_caps is a pointer; fill the caller's per-model buffer

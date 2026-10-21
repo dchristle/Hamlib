@@ -682,6 +682,16 @@ static void mock_service_audio(struct mock_server *m, uint8_t *buf, int n,
         return;
     }
 
+    if (k == ICOM_NETWORK_PACKET_KIND_AUDIO)
+    {
+        struct icom_network_packet_audio audio;
+        if (icom_network_packet_parse_audio(buf, (size_t)n, &audio) == RIG_OK)
+        {
+            m->audio_tx_bytes += audio.payload_length;
+        }
+        return;
+    }
+
     /* The radio answers the audio stream's pings like any other. */
     if (k == ICOM_NETWORK_PACKET_KIND_PING && buf[0x10] == 0x00)
     {
