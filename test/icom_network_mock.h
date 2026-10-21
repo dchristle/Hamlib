@@ -157,6 +157,7 @@ struct mock_server
     HAMLIB_ATOMIC int rx_packets;
     HAMLIB_ATOMIC int audio_tx_bytes;
     HAMLIB_ATOMIC int audio_tx_sequence;
+    uint8_t audio_tx_prefix[32];
 
     /* Scripted audio. Setting audio_script_go sends audio_script_count data
      * packets, in the order listed, with the sequence numbers in audio_script;

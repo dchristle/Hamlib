@@ -688,6 +688,13 @@ static void mock_service_audio(struct mock_server *m, uint8_t *buf, int n,
         if (icom_network_packet_parse_audio(buf, (size_t)n, &audio) == RIG_OK)
         {
             m->audio_tx_sequence = icom_network_get_le16(buf + ICOM_NETWORK_OFF_SEQUENCE);
+            int offset = m->audio_tx_bytes;
+            if (offset < (int)sizeof(m->audio_tx_prefix))
+            {
+                size_t n = sizeof(m->audio_tx_prefix) - offset;
+                if (n > audio.payload_length) { n = audio.payload_length; }
+                memcpy(m->audio_tx_prefix + offset, audio.data, n);
+            }
             m->audio_tx_bytes += audio.payload_length;
         }
         return;

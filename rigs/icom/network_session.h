@@ -154,6 +154,11 @@ void icom_network_session_audio_stats(const struct icom_network_session *s,
 int icom_network_session_audio_wait_ms(const struct stream_reorder *r,
                                        int64_t now_ms, int64_t period_ms);
 
+/* Inject errors into the next count audio datagram send attempts; return the
+ * previous remaining count. Configure only while the test producer is idle. */
+int icom_network_session_test_fail_audio_sends(struct icom_network_session *s,
+        int err, int count);
+
 void icom_network_session_test_fail_socket(struct icom_network_session *s,
         enum icom_network_socket_role role, int err);
 

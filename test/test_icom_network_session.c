@@ -30,6 +30,7 @@
 #include "network_session.h"
 #include "network_seqbuf.h"
 #include "network_proto.h"
+#include "network_utils.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -632,6 +633,80 @@ void test_session_civ_duplicate_dropped(void)
 #define TEST_TRANSIENT_SOCKET_ERROR EAGAIN
 #define TEST_HARD_SOCKET_ERROR      ECONNREFUSED
 #endif
+
+static void audio_send_retry_case(int scenario)
+{
+    struct mock_server mock;
+    struct icom_network_session_config config;
+    mock_start(&mock);
+    capability_config(&config, &mock, "IC-7610");
+    config.tx_enable = 1;
+    struct icom_network_session *s = icom_network_session_alloc(&config);
+    TEST_ASSERT(s != NULL);
+    TEST_ASSERT(icom_network_session_connect(s) == RIG_OK);
+    unsigned generation;
+    TEST_ASSERT(icom_network_audio_start(s, ICOM_NETWORK_AUDIO_TX,
+                                         &generation) == RIG_OK);
+    uint8_t pcm[32];
+    for (unsigned i = 0; i < sizeof(pcm); ++i) { pcm[i] = (uint8_t)i; }
+
+    if (scenario == 0)
+    {
+#ifdef __MINGW32__
+        int errors[] = { WSAEWOULDBLOCK, WSAEINTR, WSAENOBUFS };
+#else
+        int errors[] = { EAGAIN, EINTR, ENOBUFS };
+#endif
+        for (unsigned e = 0; e < sizeof(errors) / sizeof(errors[0]); ++e)
+        {
+            icom_network_session_test_fail_audio_sends(s, errors[e], 3);
+            TEST_ASSERT(icom_network_audio_send(s, generation, pcm, 16) == 16);
+            TEST_CHECK(icom_network_session_test_fail_audio_sends(s, 0, 0) == 0);
+            int expected = (int)(e * 32 + 16);
+            for (int i = 0; i < 100 && mock.audio_tx_bytes < expected; ++i)
+                { hl_usleep(1000); }
+            TEST_ASSERT(mock.audio_tx_bytes == expected);
+            uint16_t sequence = (uint16_t)mock.audio_tx_sequence;
+            TEST_CHECK(sequence == (uint16_t)(e * 2 + 1));
+            TEST_ASSERT(icom_network_audio_send(s, generation, pcm + 16, 16) == 16);
+            expected += 16;
+            for (int i = 0; i < 100 && mock.audio_tx_bytes < expected; ++i)
+                { hl_usleep(1000); }
+            TEST_ASSERT(mock.audio_tx_bytes == expected);
+            TEST_CHECK((uint16_t)mock.audio_tx_sequence == (uint16_t)(sequence + 1));
+        }
+        TEST_CHECK(memcmp(mock.audio_tx_prefix, pcm, sizeof(pcm)) == 0);
+    }
+    else
+    {
+        int err = scenario == 1 ? TEST_TRANSIENT_SOCKET_ERROR : TEST_HARD_SOCKET_ERROR;
+        icom_network_session_test_fail_audio_sends(s, err, 1000);
+        int64_t started = icom_network_now_ms();
+        TEST_CHECK(icom_network_audio_send(s, generation, pcm, 16) == -RIG_EIO);
+        int64_t elapsed = icom_network_now_ms() - started;
+        int remaining = icom_network_session_test_fail_audio_sends(s, 0, 0);
+        /* Scheduling can delay return, but no new attempt follows the deadline. */
+        TEST_CHECK_(elapsed < 100, "send took %lld ms", (long long)elapsed);
+        if (scenario == 1)
+        {
+            TEST_CHECK(elapsed >= 9);
+            TEST_CHECK(remaining > 0 && remaining < 999);
+        }
+        else { TEST_CHECK(remaining == 999); }
+        hl_usleep(20000);
+        TEST_CHECK(mock.audio_tx_bytes == 0);
+    }
+    icom_network_audio_stop(s, ICOM_NETWORK_AUDIO_TX, generation);
+    icom_network_session_free(s);
+    mock_stop(&mock);
+}
+
+void test_session_audio_send_retries_preserve_datagrams(void)
+{ audio_send_retry_case(0); }
+void test_session_audio_send_retry_deadline(void)
+{ audio_send_retry_case(1); }
+void test_session_audio_send_hard_error_is_immediate(void)
+{ audio_send_retry_case(2); }
 
 /* Wait up to ms for the session to be declared lost; returns the time taken,
  * or -1 if it stayed valid. */
@@ -2143,6 +2218,9 @@ void test_session_audio_users(void)
 
 TEST_LIST =
 {
+    { "audio_send_retries_preserve_datagrams", test_session_audio_send_retries_preserve_datagrams },
+    { "audio_send_retry_deadline", test_session_audio_send_retry_deadline },
+    { "audio_send_hard_error_is_immediate", test_session_audio_send_hard_error_is_immediate },
 #ifndef __MINGW32__
     { "broken_udp_no_sigpipe", test_session_broken_udp_no_sigpipe },
 #endif
