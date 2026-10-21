@@ -310,6 +310,20 @@ static int icom_network_session_socket_open(struct icom_network_session_socket
         return -RIG_EIO;
     }
 
+#ifdef SO_NOSIGPIPE
+    /* Connected UDP can raise SIGPIPE after a local socket failure. Keep
+     * that failure local to this session without changing process signals. */
+    {
+        int enabled = 1;
+        if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+                       sizeof(enabled)) != 0)
+        {
+            icom_network_session_close_fd(fd);
+            return -RIG_EIO;
+        }
+    }
+#endif
+
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_port = htons(port);
@@ -433,11 +447,14 @@ static int icom_network_session_send_raw(
     struct icom_network_session_socket *sock, const uint8_t *packet,
     size_t length)
 {
+    int flags = 0;
 #ifdef MSG_DONTWAIT
-    ssize_t w = send(sock->fd, packet, length, MSG_DONTWAIT);
-#else
-    ssize_t w = send(sock->fd, packet, length, 0);
+    flags |= MSG_DONTWAIT;
 #endif
+#ifdef MSG_NOSIGNAL
+    flags |= MSG_NOSIGNAL;
+#endif
+    ssize_t w = send(sock->fd, packet, length, flags);
 
     if (w == (ssize_t)length) { return RIG_OK; }
 

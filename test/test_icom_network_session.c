@@ -32,6 +32,7 @@
 #include "network_proto.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -677,6 +678,41 @@ void test_session_civ_silence_is_link_timeout(void)
     icom_network_session_free(s);
     mock_stop(&mock);
 }
+
+#ifndef __MINGW32__
+void test_session_broken_udp_no_sigpipe(void)
+{
+    struct mock_server mock;
+    struct icom_network_session_config config;
+    mock_start(&mock);
+    capability_config(&config, &mock, "IC-7610");
+    struct icom_network_session *s = icom_network_session_alloc(&config);
+    TEST_ASSERT(s != NULL);
+    TEST_ASSERT(icom_network_session_connect(s) == RIG_OK);
+    int civ_fd = -1;
+    for (int fd = 0; fd < FD_SETSIZE; ++fd)
+    {
+        struct sockaddr_in peer;
+        socklen_t length = sizeof(peer);
+        if (getpeername(fd, (struct sockaddr *)&peer, &length) == 0
+                && peer.sin_family == AF_INET
+                && peer.sin_port == htons(mock.civ_port))
+        {
+            civ_fd = fd;
+            break;
+        }
+    }
+    TEST_ASSERT(civ_fd >= 0);
+    void (*previous)(int) = signal(SIGPIPE, SIG_DFL);
+    /* Inject a real kernel EPIPE on the session's own CI-V UDP socket. */
+    TEST_ASSERT(shutdown(civ_fd, SHUT_WR) == 0);
+    uint8_t cmd[] = { 0xfe, 0xfe, 0x98, 0xe0, 0x03, 0xfd };
+    TEST_CHECK(icom_network_civ_send(s, cmd, sizeof(cmd)) == -RIG_EIO);
+    icom_network_session_free(s);
+    TEST_CHECK(signal(SIGPIPE, previous) == SIG_DFL);
+    mock_stop(&mock);
+}
+#endif
 
 /* The radio's CI-V port refuses packets. Where the system reports that (an
  * ICMP port-unreachable reaching a connected UDP socket), it shows up as a
@@ -2107,6 +2143,9 @@ void test_session_audio_users(void)
 
 TEST_LIST =
 {
+#ifndef __MINGW32__
+    { "broken_udp_no_sigpipe", test_session_broken_udp_no_sigpipe },
+#endif
     { "handshake_and_civ_roundtrip", test_session_handshake_and_civ_roundtrip },
     { "stale_frame_drain",           test_session_stale_frame_drain },
     { "async_routing",               test_session_async_routing },
