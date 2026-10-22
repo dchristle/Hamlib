@@ -35,6 +35,12 @@ struct rig_stream_tx_target;
 
 /* --- Loss accounting (backend- and client-facing) --- */
 
+/* Caller holds stream->ringbuf.lock. */
+void stream_push_tx_target_locked(struct rig_stream *stream,
+                                  const struct rig_stream_tx_target *target);
+int stream_pop_tx_target_locked(struct rig_stream *stream, uint64_t up_to_index,
+                                struct rig_stream_tx_target *target);
+
 /* Backend-facing: report a radio/network-side gap of dropped_samples samples
  * (0 = size unknown) detected in the radio protocol. Call BEFORE writing
  * the post-gap data; follow with a DISCONTINUITY anchor push.

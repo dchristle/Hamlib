@@ -664,13 +664,48 @@ static void *dummy_stream_tx_scheduler(void *arg)
             continue;
         }
 
-        /* Process burst targets reachable within the next frame */
-        struct rig_stream_tx_target tgt;
+        size_t got = 0;
+        int waited = 0;
 
-        while (rig_stream_pop_tx_target(stream,
-                                        ds->tx_consumed + frame_samples,
-                                        &tgt))
+        for (;;)
         {
+            struct rig_stream_tx_target tgt;
+            pthread_mutex_lock(&stream->ringbuf.lock);
+            uint64_t reachable = stream->ringbuf.write_total
+                                 / ((size_t)sample_size * channels);
+
+            if (reachable > ds->tx_consumed + frame_samples)
+            {
+                reachable = ds->tx_consumed + frame_samples;
+            }
+
+            int have_target = stream_pop_tx_target_locked(stream, reachable, &tgt);
+
+            if (!have_target && !stream->ringbuf.count && !waited)
+            {
+                stream_ringbuf_wait_data_locked(&stream->ringbuf, 100);
+                waited = 1;
+                reachable = stream->ringbuf.write_total
+                            / ((size_t)sample_size * channels);
+
+                if (reachable > ds->tx_consumed + frame_samples)
+                {
+                    reachable = ds->tx_consumed + frame_samples;
+                }
+
+                have_target = stream_pop_tx_target_locked(stream, reachable, &tgt);
+            }
+
+            if (!have_target)
+            {
+                got = stream_ringbuf_consume_locked(&stream->ringbuf, buf,
+                                                    frame_bytes);
+                pthread_mutex_unlock(&stream->ringbuf.lock);
+                break;
+            }
+
+            pthread_mutex_unlock(&stream->ringbuf.lock);
+
             if (tgt.flags & RIG_STREAM_TIME_FLAG_TX_TIMED)
             {
                 int64_t now_s;
@@ -719,8 +754,6 @@ static void *dummy_stream_tx_scheduler(void *arg)
                 rig_set_ptt(ds->rig, RIG_VFO_CURR, RIG_PTT_OFF);
             }
         }
-
-        size_t got = stream_ringbuf_read(&stream->ringbuf, buf, frame_bytes, 100);
 
         if (got > 0)
         {

@@ -549,8 +549,11 @@ Semantics:
   `read_info.sample_index` is the frame's decoded start index and
   `read_info.codec_frame_samples` its decoded duration (0 = unknown; on a
   remote rig the duration is not carried per packet, only the index).
-  `rig_stream_write()` carries exactly one codec frame per call with the
-  duration declared in `write_info.codec_frame_samples`, the frame must
+  A nonempty `rig_stream_write()` carries exactly one codec frame per call
+  with the duration declared in `write_info.codec_frame_samples`. A zero-length
+  write requires a burst target and `codec_frame_samples == 0`; it publishes
+  only that target at the accepted decoded-sample position without advancing
+  the position or queuing a frame. A nonempty frame must
   fit `rig_stream_get_max_payload()`, and a full TX ring **blocks** up to
   `timeout_ms` (returns `-RIG_ETIMEOUT`; the write side never drops or
   overwrites). RX mute discards frames (zeroed bytes are not a valid
@@ -560,8 +563,15 @@ Semantics:
   which cannot wait) a full ring drops the NEWEST frame, counted as an
   overrun with its duration in `dropped_samples_overrun` and the loss
   surfacing to the reader as a start-index jump.
-- **drain** (TX) blocks until the ring buffer drains or the timeout
-  elapses.
+- **PCM writes** accept only whole-frame prefixes and preserve unread TX
+  samples. Retry the unaccepted suffix after partial progress. Conversion
+  may retain one bounded slice until the ring has room; a full ring with
+  no progress returns `-RIG_ETIMEOUT`.
+- **drain** (TX) finishes the current conversion segment, including the
+  resampler tail, then waits for the ring and backend. After a timeout,
+  retry drain or close to discard pending output; write again only after
+  successful drain. The next write starts a fresh segment. Backend
+  completion does not necessarily mean radio playout has finished.
 - **pause/resume** stop and restart backend device I/O. **mute/unmute**
   act at the ring-buffer level (RX writes discarded, TX reads return
   zeros). They are independent: a stream can be muted but not paused, and
@@ -581,7 +591,8 @@ Semantics:
   concurrent call therefore either completes normally or fails cleanly —
   it can never touch a freed stream. Backend close errors are returned
   after cleanup. The handle is invalid even on failure; do not retry close.
-- **Thread safety:** a single consumer per stream. Concurrent reads on the
+- **Thread safety:** one writer per stream, with no concurrent write and
+  drain, and a single consumer per stream. Concurrent reads on the
   same stream split data unpredictably — the ring-buffer lock prevents
   corruption, not logical interleaving.
 
@@ -1879,6 +1890,28 @@ struct rig_stream_write_info {
     uint8_t  flags;                 /* SOB/EOB */
 };
 ```
+
+PCM writes may accept a whole-frame prefix, including converted output retained
+until ring space becomes available. Always use `bytes_written` to advance the
+input, even if the call also returns an error. Retry only the unaccepted suffix;
+a target accepted with the first prefix must not be repeated on that retry.
+Invalid or zero-progress data writes do not publish a target. A successful
+zero-length PCM write explicitly publishes a target after all accepted output,
+including retained conversion output, without waiting for ring space. Data
+writes flush previously retained output before publishing their target. Neither
+operation provides sample-accurate mapping of resampler filter latency. A
+metadata-only write does not move pending PCM or finish the filter; normal
+completion still requires `rig_stream_drain()`.
+
+The rigctld UDP TX feeder remains nonblocking. If the backend cannot accept the
+whole datagram, the feeder reports an overrun for the discarded suffix rather
+than overwriting queued PCM. If none of a marked PCM or codec datagram was
+accepted, its burst target is submitted separately so a discarded payload does
+not silently lose a timing or PTT boundary. The event reports an exact dropped-frame count for
+same-rate PCM; it uses zero (not applicable) for opaque codecs or rate conversion
+where the rejected input has no exact backend-frame count. The diagnostic gives
+the discarded input-byte count. Retryable short writes by direct API callers do
+not themselves count as overruns.
 
 `rig_stream_write(…, info)` with `time_valid` schedules a burst: samples
 go to the ring buffer, the target to a mirror per-stream target ring that

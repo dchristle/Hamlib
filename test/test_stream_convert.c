@@ -798,8 +798,213 @@ void test_conversion_context_rate_bounds(void)
 }
 
 
+struct partial_sink
+{
+    float output[64];
+    size_t bytes;
+};
+
+static size_t accept_partial(void *ctx, const void *buf, size_t len)
+{
+    struct partial_sink *sink = ctx;
+
+    if (len > sizeof(float)) { len = sizeof(float); }
+
+    memcpy((unsigned char *)sink->output + sink->bytes, buf, len);
+    sink->bytes += len;
+    return len;
+}
+
+void test_conversion_retains_partial_output(void)
+{
+    struct stream_conv *conv = NULL;
+    TEST_ASSERT(stream_conv_init(&conv,
+                                 RIG_STREAM_FORMAT_PCM_S16, 48000, 1,
+                                 RIG_STREAM_FORMAT_PCM_F32, 48000, 1,
+                                 0, RIG_RESAMPLE_FAST) == RIG_OK);
+    int16_t input[64];
+
+    for (int i = 0; i < 64; ++i) { input[i] = (int16_t)(i * 100); }
+
+    struct partial_sink sink = { { 0 }, 0 };
+
+    TEST_CHECK(stream_conv_process(conv, input, sizeof(input), accept_partial,
+                                   &sink) == sizeof(input));
+
+    for (int i = 0; i < 64; ++i)
+    {
+        if (!stream_conv_flush_pending(conv, accept_partial, &sink)) { break; }
+    }
+
+    TEST_CHECK(sink.bytes == sizeof(sink.output));
+
+    for (int i = 0; i < 64; ++i)
+    {
+        TEST_CHECK(fabs(sink.output[i] - input[i] / 32768.0) < 0.0001);
+    }
+
+    stream_conv_free(conv);
+}
+
+#ifdef HAVE_SAMPLERATE
+struct resample_sink
+{
+    float output[10000];
+    size_t bytes;
+    size_t limit;
+};
+
+static size_t collect_resampled(void *ctx, const void *buf, size_t len)
+{
+    struct resample_sink *sink = ctx;
+
+    if (len > sink->limit) { len = sink->limit; }
+
+    TEST_ASSERT(sink->bytes + len <= sizeof(sink->output));
+    memcpy((unsigned char *)sink->output + sink->bytes, buf, len);
+    sink->bytes += len;
+    return len;
+}
+
+void test_resampler_backpressure_preserves_state(void)
+{
+    struct resample_sink full = { { 0 }, 0, 40000 };
+    struct resample_sink partial = { { 0 }, 0, 28 };
+    float input[2048];
+
+    for (int i = 0; i < 2048; ++i) { input[i] = (float)sin(i * 0.03); }
+
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        struct stream_conv *conv = NULL;
+        TEST_ASSERT(stream_conv_init(&conv,
+                                     RIG_STREAM_FORMAT_PCM_F32, 12000, 1,
+                                     RIG_STREAM_FORMAT_PCM_F32, 48000, 1,
+                                     0, RIG_RESAMPLE_FAST) == RIG_OK);
+        struct resample_sink *sink = pass ? &partial : &full;
+        size_t offset = 0;
+
+        for (int i = 0; i < 10000 && offset < sizeof(input); ++i)
+        {
+            ssize_t n = stream_conv_process(conv,
+                                            (unsigned char *)input + offset, sizeof(input) - offset,
+                                            collect_resampled, sink);
+            TEST_ASSERT(n >= 0);
+            offset += (size_t)n;
+        }
+
+        TEST_CHECK(offset == sizeof(input));
+
+        for (int i = 0; i < 10000; ++i)
+        {
+            if (!stream_conv_flush_pending(conv, collect_resampled, sink)) { break; }
+        }
+
+        stream_conv_free(conv);
+    }
+
+    TEST_CHECK(full.bytes > 0);
+    TEST_CHECK(partial.bytes == full.bytes);
+    TEST_CHECK(memcmp(partial.output, full.output, full.bytes) == 0);
+}
+
+static void check_resampler_finite_tail(int quality)
+{
+    float input[4096];
+    float expected[1024];
+
+    for (int i = 0; i < 4096; ++i)
+    {
+        input[i] = (float)(0.5 * sin(i * 0.03));
+    }
+
+    size_t expected_frames = 1024;
+    TEST_ASSERT(rig_stream_resample(input, 48000, expected, 12000,
+                                    4096, &expected_frames, 1, quality) == 0);
+    struct resample_sink sink = { { 0 }, 0, 28 };
+    struct stream_conv *conv = NULL;
+    TEST_ASSERT(stream_conv_init(&conv,
+                                 RIG_STREAM_FORMAT_PCM_F32, 48000, 1,
+                                 RIG_STREAM_FORMAT_PCM_F32, 12000, 1,
+                                 0, quality) == RIG_OK);
+    size_t offset = 0;
+
+    for (int i = 0; i < 10000 && offset < sizeof(input); ++i)
+    {
+        ssize_t n = stream_conv_process(conv,
+                                        (unsigned char *)input + offset, sizeof(input) - offset,
+                                        collect_resampled, &sink);
+        TEST_ASSERT(n >= 0);
+        offset += (size_t)n;
+    }
+
+    TEST_CHECK(offset == sizeof(input));
+    sink.limit = 0;
+    TEST_CHECK(stream_conv_finish(conv, collect_resampled, &sink) == 1);
+    TEST_CHECK(stream_conv_process(conv, input, sizeof(input),
+                                   collect_resampled, &sink) == -1);
+    sink.limit = 28;
+
+    for (int i = 0; i < 10000; ++i)
+    {
+        int ret = stream_conv_finish(conv, collect_resampled, &sink);
+        TEST_ASSERT(ret >= 0);
+
+        if (ret == 0) { break; }
+    }
+
+    TEST_CHECK(sink.bytes == expected_frames * sizeof(float));
+    TEST_MSG("finite output: %zu frames, expected %zu", sink.bytes / sizeof(float),
+             expected_frames);
+
+    if (sink.bytes == expected_frames * sizeof(float))
+    {
+        for (size_t i = 0; i < expected_frames; ++i)
+        {
+            TEST_CHECK(fabs(sink.output[i] - expected[i]) < 0.00001);
+        }
+    }
+
+    size_t completed_bytes = sink.bytes;
+
+    for (int i = 0; i < 20; ++i)
+    {
+        TEST_CHECK(stream_conv_finish(conv, collect_resampled, &sink) == 0);
+    }
+
+    TEST_CHECK(stream_conv_process(conv, input, 0, collect_resampled, &sink) == 0);
+    TEST_CHECK(stream_conv_finish(conv, collect_resampled, &sink) == 0);
+    TEST_CHECK(sink.bytes == completed_bytes);
+    sink.bytes = 0;
+    sink.limit = sizeof(sink.output);
+    TEST_CHECK(stream_conv_process(conv, input, sizeof(input), collect_resampled,
+                                   &sink) == sizeof(input));
+    TEST_CHECK(stream_conv_finish(conv, collect_resampled, &sink) == 0);
+    TEST_CHECK(sink.bytes == completed_bytes);
+
+    for (size_t i = 0; i < expected_frames; ++i)
+    {
+        TEST_CHECK(fabs(sink.output[i] - expected[i]) < 0.00001);
+    }
+
+    stream_conv_free(conv);
+}
+
+void test_resampler_finite_tail(void)
+{
+    check_resampler_finite_tail(RIG_RESAMPLE_FAST);
+    check_resampler_finite_tail(RIG_RESAMPLE_MEDIUM);
+    check_resampler_finite_tail(RIG_RESAMPLE_BEST);
+}
+#endif
+
 TEST_LIST =
 {
+#ifdef HAVE_SAMPLERATE
+    { "resampler_finite_tail", test_resampler_finite_tail },
+    { "resampler_backpressure_preserves_state", test_resampler_backpressure_preserves_state },
+#endif
+    { "conversion_retains_partial_output", test_conversion_retains_partial_output },
     { "sample_size",              test_sample_size },
     { "same_format_memcpy",       test_same_format_memcpy },
     /* Direct integer converters */

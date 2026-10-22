@@ -2812,6 +2812,267 @@ void test_write_status_emit(void)
 }
 
 
+static int feeder_test_stream_open(RIG *rig, struct rig_stream *stream)
+{
+    (void)rig;
+    (void)stream;
+    return RIG_OK;
+}
+
+static const struct rig_stream_caps feeder_test_stream_caps[] =
+{
+    {
+        .type = RIG_STREAM_TYPE_AUDIO_TX,
+        .formats = RIG_STREAM_FORMAT_PCM_F32 | RIG_STREAM_FORMAT_OPUS,
+        .sample_rates = { 48000, 0 },
+        .channels = { 1, 0 },
+        .max_streams = 1,
+        .caps_flags = RIG_STREAM_CAP_TIMED_TX_COARSE,
+    },
+    { 0 }
+};
+
+static struct rig_caps feeder_test_caps =
+{
+    .rig_model = 1,
+    .model_name = "Feeder stub",
+    .mfg_name = "Test",
+    .version = "1.0",
+    .status = RIG_STATUS_STABLE,
+    .rig_type = RIG_TYPE_TRANSCEIVER,
+    .port_type = RIG_PORT_NONE,
+    .stream_caps = feeder_test_stream_caps,
+    .stream_open = feeder_test_stream_open,
+    .stream_close = feeder_test_stream_open,
+};
+
+void test_tx_payload_reports_discarded_suffix(void)
+{
+    rig_register(&feeder_test_caps);
+    RIG *rig = rig_init(feeder_test_caps.rig_model);
+    TEST_ASSERT(rig != NULL);
+    TEST_ASSERT(rig_open(rig) == RIG_OK);
+    struct rig_stream_config *cfg = rig_stream_config_alloc();
+    TEST_ASSERT(cfg != NULL);
+    cfg->type = RIG_STREAM_TYPE_AUDIO_TX;
+    cfg->format = RIG_STREAM_FORMAT_PCM_F32;
+    cfg->sample_rate = 48000;
+    cfg->channels = 1;
+    cfg->buffer_bytes = 64;
+    rig_stream_t *backend = NULL;
+    TEST_ASSERT(rig_stream_open(rig, cfg, &backend) == RIG_OK);
+    struct rigctld_stream stream = { 0 };
+    stream.rig = rig;
+    stream.backend_stream = backend;
+    stream.config = *cfg;
+    stream.type = cfg->type;
+    stream.stream_id = 7;
+    stream.subscribe_token = 123;
+    stream.format_id = RIG_STREAM_FMT_ID_PCM_F32;
+    int rx_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    stream.udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    TEST_ASSERT(rx_fd >= 0 && stream.udp_sock >= 0);
+    struct sockaddr_in dst = { 0 };
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    TEST_ASSERT(bind(rx_fd, (struct sockaddr *)&dst, sizeof(dst)) == 0);
+    socklen_t dst_len = sizeof(dst);
+    TEST_ASSERT(getsockname(rx_fd, (struct sockaddr *)&dst, &dst_len) == 0);
+    memcpy(&stream.client_addr, &dst, sizeof(dst));
+    stream.client_addr_len = dst_len;
+    stream.client_addr_known = 1;
+    float input[32], output[16];
+
+    for (int i = 0; i < 32; i++) { input[i] = i / 32.0f; }
+
+    struct rig_stream_write_info info = { 0 };
+
+    info.time_valid = 1;
+
+    info.seconds = 1;
+
+    info.flags = RIG_STREAM_TIME_FLAG_SOB;
+
+    TEST_CHECK(rigctld_stream_write_payload(&stream, input, sizeof(input), &info)
+               == RIG_OK);
+
+    TEST_CHECK(stream.timestamp == 32);
+
+    struct rig_stream_tx_target target;
+
+    TEST_CHECK(rig_stream_pop_tx_target(backend, UINT64_MAX, &target) == 1);
+    TEST_CHECK(target.sample_index == 0);
+    TEST_CHECK(backend->tx_target_count == 0);
+    struct rig_stream_write_status ev, received;
+    TEST_ASSERT(rig_stream_wait_write_status(rig, backend, &ev, 0) == RIG_OK);
+    TEST_CHECK(ev.event == RIG_STREAM_WRITE_EVENT_OVERRUN);
+    TEST_CHECK(ev.sample_index == 16);
+    TEST_CHECK(ev.dropped_samples == 16);
+    TEST_CHECK(rigctld_stream_emit_write_status(&stream, &ev) == 0);
+    TEST_CHECK(recv_write_status_event(rx_fd, &stream, &received)
+               == RIG_STREAM_WRITE_EVENT_OVERRUN);
+    TEST_CHECK(received.sample_index == 16);
+    TEST_CHECK(received.dropped_samples == 16);
+    TEST_CHECK(rigctld_stream_write_payload(&stream, input, sizeof(float), &info)
+               == -RIG_ETIMEOUT);
+    TEST_CHECK(stream.timestamp == 33);
+    TEST_CHECK(rig_stream_pop_tx_target(backend, UINT64_MAX, &target) == 1);
+    TEST_CHECK(target.sample_index == 16);
+    TEST_CHECK((target.flags & (RIG_STREAM_TIME_FLAG_TX_TIMED |
+                                RIG_STREAM_TIME_FLAG_SOB))
+               == (RIG_STREAM_TIME_FLAG_TX_TIMED | RIG_STREAM_TIME_FLAG_SOB));
+    TEST_CHECK(backend->tx_target_count == 0);
+    TEST_ASSERT(rig_stream_wait_write_status(rig, backend, &ev, 0) == RIG_OK);
+    TEST_CHECK(ev.dropped_samples == 1);
+    struct rig_stream_stats stats;
+    TEST_CHECK(rig_stream_get_stats(rig, backend, &stats) == RIG_OK);
+    TEST_CHECK(stats.overruns == 2);
+    TEST_CHECK(stats.dropped_samples_overrun == 17);
+    TEST_CHECK(stream_ringbuf_read(&backend->ringbuf, output, sizeof(output), 0)
+               == sizeof(output));
+    TEST_CHECK(memcmp(input, output, sizeof(output)) == 0);
+    TEST_CHECK(rigctld_stream_write_payload(&stream, input, sizeof(float), NULL)
+               == RIG_OK);
+    TEST_CHECK(rig_stream_wait_write_status(rig, backend, &ev, 0) == -RIG_ETIMEOUT);
+    TEST_CHECK(stream.timestamp == 34);
+    rig_stream_close(rig, backend);
+#ifdef HAVE_SAMPLERATE
+    cfg->sample_rate = 12000;
+    TEST_ASSERT(rig_stream_open(rig, cfg, &backend) == RIG_OK);
+    stream.backend_stream = backend;
+    stream.config = *cfg;
+    float converted_input[1024] = { 0 };
+    TEST_CHECK(rigctld_stream_write_payload(&stream, converted_input,
+                                            sizeof(converted_input), NULL) == RIG_OK);
+    TEST_ASSERT(stream_conv_pending_frames(backend->conv) > 0);
+    uint64_t marker_index = rig_stream_get_samples_written(backend)
+                            + stream_conv_pending_frames(backend->conv);
+    TEST_CHECK(rigctld_stream_write_payload(&stream, input, sizeof(float), &info)
+               == -RIG_ETIMEOUT);
+    TEST_CHECK(rig_stream_pop_tx_target(backend, UINT64_MAX, &target) == 1);
+    TEST_CHECK(target.sample_index == marker_index);
+    TEST_CHECK(backend->tx_target_count == 0);
+    TEST_ASSERT(rig_stream_wait_write_status(rig, backend, &ev, 0) == RIG_OK);
+    TEST_CHECK(ev.event == RIG_STREAM_WRITE_EVENT_OVERRUN);
+    TEST_CHECK(ev.dropped_samples == 0);
+    TEST_CHECK(rig_stream_get_stats(rig, backend, &stats) == RIG_OK);
+    TEST_CHECK(stats.overruns == 1);
+    TEST_CHECK(stats.dropped_samples_overrun == 0);
+    info.time_valid = 0;
+    info.flags = RIG_STREAM_TIME_FLAG_EOB;
+    TEST_CHECK(rigctld_stream_write_payload(&stream, input, 0, &info) == RIG_OK);
+    TEST_CHECK(rig_stream_pop_tx_target(backend, UINT64_MAX, &target) == 1);
+    TEST_CHECK(target.sample_index == marker_index);
+    TEST_CHECK(target.flags == RIG_STREAM_TIME_FLAG_EOB);
+    TEST_CHECK(stream_conv_pending_frames(backend->conv) > 0);
+    rig_stream_close(rig, backend);
+#endif
+    rig_stream_config_free(cfg);
+    rig_close(rig);
+    rig_cleanup(rig);
+    close(rx_fd);
+    close(stream.udp_sock);
+}
+
+void test_tx_codec_payload_preserves_discarded_target(void)
+{
+    rig_register(&feeder_test_caps);
+    RIG *rig = rig_init(feeder_test_caps.rig_model);
+    TEST_ASSERT(rig != NULL);
+    TEST_ASSERT(rig_open(rig) == RIG_OK);
+    struct rig_stream_config *cfg = rig_stream_config_alloc();
+    TEST_ASSERT(cfg != NULL);
+    cfg->type = RIG_STREAM_TYPE_AUDIO_TX;
+    cfg->format = RIG_STREAM_FORMAT_OPUS;
+    cfg->sample_rate = 48000;
+    cfg->channels = 1;
+    cfg->buffer_bytes = 1024;
+    rig_stream_t *backend = NULL;
+    TEST_ASSERT(rig_stream_open(rig, cfg, &backend) == RIG_OK);
+    struct rigctld_stream stream = { 0 };
+    stream.rig = rig;
+    stream.backend_stream = backend;
+    stream.config = *cfg;
+    uint8_t frame[180] = { 0 }, output[180];
+    struct rig_stream_write_info info = { 0 };
+    info.codec_frame_samples = 480;
+
+    /* Five 192-byte records leave no room for another complete frame. */
+    for (int i = 0; i < 5; ++i)
+    {
+        TEST_ASSERT(rigctld_stream_write_payload(&stream, frame, sizeof(frame),
+            &info) == RIG_OK);
+    }
+
+    uint64_t accepted_index = rig_stream_get_samples_written(backend);
+    TEST_CHECK(accepted_index == 2400);
+    info.flags = RIG_STREAM_TIME_FLAG_EOB;
+    TEST_CHECK(rigctld_stream_write_payload(&stream, frame, sizeof(frame), &info)
+               == -RIG_ETIMEOUT);
+    info.flags = RIG_STREAM_TIME_FLAG_SOB;
+    info.time_valid = 1;
+    info.seconds = 1;
+    TEST_CHECK(rigctld_stream_write_payload(&stream, frame, sizeof(frame), &info)
+               == -RIG_ETIMEOUT);
+    TEST_CHECK(backend->tx_target_count == 2);
+    struct rig_stream_tx_target target;
+    TEST_CHECK(rig_stream_pop_tx_target(backend, UINT64_MAX, &target) == 1);
+    TEST_CHECK(target.sample_index == accepted_index);
+    TEST_CHECK(target.flags == RIG_STREAM_TIME_FLAG_EOB);
+    TEST_CHECK(rig_stream_pop_tx_target(backend, UINT64_MAX, &target) == 1);
+    TEST_CHECK(target.sample_index == accepted_index);
+    TEST_CHECK(target.flags == (RIG_STREAM_TIME_FLAG_SOB |
+                                RIG_STREAM_TIME_FLAG_TX_TIMED));
+    TEST_CHECK(target.seconds == 1);
+    TEST_CHECK(backend->tx_target_count == 0);
+    TEST_CHECK(rig_stream_get_samples_written(backend) == accepted_index);
+    struct rig_stream_stats stats;
+    TEST_CHECK(rig_stream_get_stats(rig, backend, &stats) == RIG_OK);
+    TEST_CHECK(stats.codec_frames == 5);
+    TEST_CHECK(stats.overruns == 2);
+    struct rig_stream_write_status event;
+
+    for (int i = 0; i < 2; ++i)
+    {
+        TEST_CHECK(rig_stream_wait_write_status(rig, backend, &event, 0) == RIG_OK);
+        TEST_CHECK(event.event == RIG_STREAM_WRITE_EVENT_OVERRUN);
+        TEST_CHECK(event.sample_index == accepted_index);
+        TEST_CHECK(event.dropped_samples == 0);
+    }
+
+    TEST_CHECK(rig_stream_wait_write_status(rig, backend, &event, 0)
+               == -RIG_ETIMEOUT);
+    size_t length = 0;
+    uint32_t duration = 0;
+    uint64_t index = 0;
+    TEST_CHECK(stream_backend_read_frame(backend, output, sizeof(output), &length,
+                                         &duration, &index, 0) == RIG_OK);
+    TEST_CHECK(rigctld_stream_write_payload(&stream, frame, sizeof(frame), &info)
+               == RIG_OK);
+    TEST_CHECK(rig_stream_pop_tx_target(backend, UINT64_MAX, &target) == 1);
+    TEST_CHECK(target.sample_index == accepted_index);
+    TEST_CHECK(backend->tx_target_count == 0);
+    TEST_CHECK(rig_stream_wait_write_status(rig, backend, &event, 0)
+               == -RIG_ETIMEOUT);
+
+    info.codec_frame_samples = UINT16_MAX + 1U;
+    TEST_CHECK(rigctld_stream_write_payload(&stream, frame, sizeof(frame), &info)
+               == -RIG_EINVAL);
+    TEST_CHECK(backend->tx_target_count == 0);
+    TEST_CHECK(rig_stream_wait_write_status(rig, backend, &event, 0)
+               == -RIG_ETIMEOUT);
+    stream_mark_failed(backend, RIG_COMM_REASON_LINK_TIMEOUT);
+    TEST_CHECK(rigctld_stream_write_payload(&stream, frame, sizeof(frame), &info)
+               == -RIG_EIO);
+    TEST_CHECK(backend->tx_target_count == 0);
+    TEST_CHECK(rig_stream_get_stats(rig, backend, &stats) == RIG_OK);
+    TEST_CHECK(stats.overruns == 2);
+    rig_stream_close(rig, backend);
+    rig_stream_config_free(cfg);
+    rig_close(rig);
+    rig_cleanup(rig);
+}
+
 /* --- require_native stage list on the wire --- */
 
 /* The mask renders to the stage names the \stream_open require_native= key
@@ -2922,6 +3183,8 @@ void test_native_req_unknown_name(void)
 
 TEST_LIST =
 {
+    { "tx_payload_reports_discarded_suffix", test_tx_payload_reports_discarded_suffix },
+    { "tx_codec_payload_preserves_discarded_target", test_tx_codec_payload_preserves_discarded_target },
     /* Subscribe token */
     { "subscribe_token_entropy",    test_subscribe_token_entropy },
 

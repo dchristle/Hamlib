@@ -128,7 +128,14 @@ int stream_push_tx_target(struct rig_stream *stream,
     }
 
     pthread_mutex_lock(&stream->ringbuf.lock);
+    stream_push_tx_target_locked(stream, target);
+    pthread_mutex_unlock(&stream->ringbuf.lock);
+    return RIG_OK;
+}
 
+void stream_push_tx_target_locked(struct rig_stream *stream,
+                                  const struct rig_stream_tx_target *target)
+{
     stream->tx_targets[stream->tx_target_head] = *target;
     stream->tx_target_head = (stream->tx_target_head + 1)
                              % RIG_STREAM_TX_TARGET_DEPTH;
@@ -138,9 +145,7 @@ int stream_push_tx_target(struct rig_stream *stream,
         stream->tx_target_count++;
     }
 
-    pthread_mutex_unlock(&stream->ringbuf.lock);
-
-    return RIG_OK;
+    pthread_cond_signal(&stream->ringbuf.data_available);
 }
 
 
@@ -153,10 +158,16 @@ int rig_stream_pop_tx_target(struct rig_stream *stream, uint64_t up_to_index,
     }
 
     pthread_mutex_lock(&stream->ringbuf.lock);
+    int ret = stream_pop_tx_target_locked(stream, up_to_index, target);
+    pthread_mutex_unlock(&stream->ringbuf.lock);
+    return ret;
+}
 
+int stream_pop_tx_target_locked(struct rig_stream *stream, uint64_t up_to_index,
+                                struct rig_stream_tx_target *target)
+{
     if (stream->tx_target_count == 0)
     {
-        pthread_mutex_unlock(&stream->ringbuf.lock);
         return 0;
     }
 
@@ -165,14 +176,11 @@ int rig_stream_pop_tx_target(struct rig_stream *stream, uint64_t up_to_index,
 
     if (stream->tx_targets[oldest].sample_index > up_to_index)
     {
-        pthread_mutex_unlock(&stream->ringbuf.lock);
         return 0;
     }
 
     *target = stream->tx_targets[oldest];
     stream->tx_target_count--;
-
-    pthread_mutex_unlock(&stream->ringbuf.lock);
 
     return 1;
 }

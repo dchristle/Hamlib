@@ -84,6 +84,11 @@ int stream_conv_rate_supported(int src_rate, int dst_rate);
  * one-shot src_simple() produces boundary artifacts on continuous data. */
 struct stream_conv;
 
+#define STREAM_CONV_CHUNK_FRAMES 1024
+
+int stream_conv_is_finishing(const struct stream_conv *c);
+size_t stream_conv_pending_frames(const struct stream_conv *c);
+
 /* Sink for converted output. Returns the number of bytes accepted;
  * returning less than len stops processing (used for ring-full/timeout). */
 typedef size_t (*stream_conv_sink_fn)(void *ctx, const void *buf,
@@ -105,11 +110,22 @@ int stream_conv_init(struct stream_conv **out,
 
 /* Feed whole source-side frames through the pipeline; converted output is
  * delivered to sink in chunks. Returns the number of source bytes
- * consumed (all of len unless the sink stopped early — then a
- * proportional count), or -1 on error. */
+ * consumed, including one bounded slice whose output is retained when the
+ * sink stops early, or -1 on error. */
 ssize_t stream_conv_process(struct stream_conv *c, const void *buf,
                             size_t len, stream_conv_sink_fn sink,
                             void *ctx);
+
+/* Retry retained output; return nonzero while bytes remain pending. */
+int stream_conv_flush_pending(struct stream_conv *c,
+                              stream_conv_sink_fn sink, void *ctx);
+
+/* End a finite segment, including the resampler's retained filter tail.
+ * Returns 0 when complete, 1 when backpressure requires another call,
+ * or -1 on error. Writes must wait until complete; the next write starts
+ * a fresh segment. Freeing the context discards all pending state. */
+int stream_conv_finish(struct stream_conv *c,
+                       stream_conv_sink_fn sink, void *ctx);
 
 void stream_conv_free(struct stream_conv *c);
 

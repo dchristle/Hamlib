@@ -1562,7 +1562,8 @@ static void codec_rec_unpack(const uint8_t *hdr, uint16_t *len,
 static ssize_t codec_produce(struct rig_stream *stream, const void *buf,
                              size_t len, uint32_t duration_samples,
                              int have_index, uint64_t start_index,
-                             int account_drop)
+                             int account_drop,
+                             struct rig_stream_tx_target *target)
 {
     if (!stream || !buf)
     {
@@ -1600,15 +1601,20 @@ static ssize_t codec_produce(struct rig_stream *stream, const void *buf,
     size_t stored;
 
     pthread_mutex_lock(&stream->ringbuf.lock);
+
+    if (stream->ringbuf.closing || stream->ringbuf.failed)
+    {
+        int ret = stream->ringbuf.closing ? -RIG_ENAVAIL : -RIG_EIO;
+        pthread_mutex_unlock(&stream->ringbuf.lock);
+        return ret;
+    }
+
     uint64_t idx = have_index ? start_index : stream->codec_pos;
-    pthread_mutex_unlock(&stream->ringbuf.lock);
 
     codec_rec_pack(hdr, (uint16_t)len, (uint16_t)duration_samples, idx);
 
-    stored = stream_ringbuf_write_record(&stream->ringbuf,
-                                         hdr, sizeof(hdr), buf, len);
-
-    pthread_mutex_lock(&stream->ringbuf.lock);
+    stored = stream_ringbuf_write_record_locked(&stream->ringbuf,
+        hdr, sizeof(hdr), buf, len);
 
     if (stored == 0 && !account_drop)
     {
@@ -1634,6 +1640,12 @@ static ssize_t codec_produce(struct rig_stream *stream, const void *buf,
     if (stored != 0)
     {
         stream->codec_frames++;
+
+        if (target)
+        {
+            target->sample_index = idx;
+            stream_push_tx_target_locked(stream, target);
+        }
     }
 
     stream->codec_pos = idx + duration_samples;
@@ -1652,7 +1664,7 @@ ssize_t stream_backend_write_frame(struct rig_stream *stream,
         return 0;
     }
 
-    return codec_produce(stream, buf, len, duration_samples, 0, 0, 1);
+    return codec_produce(stream, buf, len, duration_samples, 0, 0, 1, NULL);
 }
 
 ssize_t stream_backend_write_frame_indexed(struct rig_stream *stream,
@@ -1666,7 +1678,7 @@ ssize_t stream_backend_write_frame_indexed(struct rig_stream *stream,
     }
 
     return codec_produce(stream, buf, len, duration_samples, 1, start_index,
-                         1);
+                         1, NULL);
 }
 
 /* Dequeue one whole codec-frame record under a single lock hold. cap too
@@ -2051,11 +2063,10 @@ out:
 /* rig_stream_write                                                    */
 /* ------------------------------------------------------------------ */
 
-/* Bind a burst target (scheduled time and/or SOB/EOB) to the producer index of
- * the next sample to be written. Returns RIG_OK, or an error if a timed target
- * is requested on a backend that lacks timed TX or lands beyond the horizon. */
-static int stream_bind_tx_target(rig_stream_t *stream,
-                                 const struct rig_stream_write_info *info)
+/* Validate a target before accepting its samples or publishing metadata. */
+static int stream_prepare_tx_target(rig_stream_t *stream,
+                                    const struct rig_stream_write_info *info,
+                                    struct rig_stream_tx_target *target)
 {
     if (info->time_valid)
     {
@@ -2088,23 +2099,53 @@ static int stream_bind_tx_target(rig_stream_t *stream,
         }
     }
 
-    struct rig_stream_tx_target target;
-
-    memset(&target, 0, sizeof(target));
-    target.sample_index = rig_stream_get_samples_written(stream);
-    target.flags = info->flags;
+    memset(target, 0, sizeof(*target));
+    target->flags = info->flags;
 
     if (info->time_valid)
     {
-        target.flags |= RIG_STREAM_TIME_FLAG_TX_TIMED;
-        target.seconds = info->seconds;
-        target.picoseconds = info->picoseconds;
+        target->flags |= RIG_STREAM_TIME_FLAG_TX_TIMED;
+        target->seconds = info->seconds;
+        target->picoseconds = info->picoseconds;
     }
 
-    stream_push_tx_target(stream, &target);
     return RIG_OK;
 }
 
+
+static size_t conv_tx_ring_sink(void *ctx, const void *buf, size_t len)
+{
+    struct rig_stream *s = ctx;
+    return stream_ringbuf_write_bounded(&s->ringbuf, buf, len, s->frame_bytes);
+}
+
+static size_t conv_tx_ring_sink_locked(void *ctx, const void *buf, size_t len)
+{
+    struct rig_stream *s = ctx;
+    return stream_ringbuf_write_bounded_locked(&s->ringbuf, buf, len,
+            s->frame_bytes);
+}
+
+static int stream_write_deadline(const struct timespec *start, int timeout_ms)
+{
+    if (timeout_ms < 0) { return 0; }
+
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed_ms = (now.tv_sec - start->tv_sec) * 1000
+                      + (now.tv_nsec - start->tv_nsec) / 1000000;
+    return elapsed_ms >= timeout_ms;
+}
+
+static int stream_write_stopped(struct rig_stream *stream)
+{
+    pthread_mutex_lock(&stream->ringbuf.lock);
+    int ret = stream->ringbuf.closing ? -RIG_ENAVAIL
+              : stream->ringbuf.failed ? -RIG_EIO : RIG_OK;
+    pthread_mutex_unlock(&stream->ringbuf.lock);
+    return ret;
+}
 
 int HAMLIB_API rig_stream_write(RIG *rig,
                                 rig_stream_t *stream,
@@ -2120,6 +2161,8 @@ int HAMLIB_API rig_stream_write(RIG *rig,
     {
         return -RIG_EINVAL;
     }
+
+    *bytes_written = 0;
 
     /* Hold a reference so a concurrent close waits for this write to finish
      * before it destroys the ring and frees the stream. */
@@ -2156,11 +2199,13 @@ int HAMLIB_API rig_stream_write(RIG *rig,
         goto out;
     }
 
-    /* A burst target (scheduled time and/or SOB/EOB) binds to the producer
-     * index of the first sample of this write. */
-    if (info && (info->time_valid || info->flags))
+    struct rig_stream_tx_target target;
+
+    int have_target = info && (info->time_valid || info->flags);
+
+    if (have_target)
     {
-        ret = stream_bind_tx_target(stream, info);
+        ret = stream_prepare_tx_target(stream, info, &target);
 
         if (ret != RIG_OK)
         {
@@ -2170,6 +2215,22 @@ int HAMLIB_API rig_stream_write(RIG *rig,
 
     if (stream->is_codec)
     {
+        if (buffer_size == 0 && have_target && info->codec_frame_samples == 0)
+        {
+            pthread_mutex_lock(&stream->ringbuf.lock);
+            ret = stream->ringbuf.closing ? -RIG_ENAVAIL
+                  : stream->ringbuf.failed ? -RIG_EIO : RIG_OK;
+
+            if (ret == RIG_OK)
+            {
+                target.sample_index = stream->codec_pos;
+                stream_push_tx_target_locked(stream, &target);
+            }
+
+            pthread_mutex_unlock(&stream->ringbuf.lock);
+            goto out;
+        }
+
         /* Codec stream: exactly ONE whole codec frame per call, duration
          * declared via write_info. Never dropped and never overwritten:
          * on a full ring the call polls for space up to timeout_ms. */
@@ -2180,7 +2241,7 @@ int HAMLIB_API rig_stream_write(RIG *rig,
         for (;;)
         {
             ssize_t got = codec_produce(stream, buffer, buffer_size, dur,
-                                        0, 0, 0);
+                                        0, 0, 0, have_target ? &target : NULL);
 
             if (got < 0)
             {
@@ -2209,10 +2270,63 @@ int HAMLIB_API rig_stream_write(RIG *rig,
             }
 
             /* The consumer died while we waited for space: it never will. */
-            if (stream_is_failed(stream))
+            ret = stream_write_stopped(stream);
+
+            if (ret != RIG_OK) { goto out; }
+
+            usleep(1000);
+        }
+    }
+
+    size_t frame_bytes = (size_t)rig_stream_format_sample_size(
+                             stream->config.format)
+                         * stream->config.channels;
+
+    if (!frame_bytes || buffer_size % frame_bytes
+            || stream_conv_is_finishing(stream->conv))
+    {
+        ret = -RIG_EINVAL;
+        goto out;
+    }
+
+    if (buffer_size == 0)
+    {
+        pthread_mutex_lock(&stream->ringbuf.lock);
+        ret = stream->ringbuf.closing ? -RIG_ENAVAIL
+              : stream->ringbuf.failed ? -RIG_EIO : RIG_OK;
+
+        if (ret == RIG_OK && have_target)
+        {
+            target.sample_index = stream->ringbuf.write_total / stream->frame_bytes
+                                  + stream->skipped_samples
+                                  + stream_conv_pending_frames(stream->conv);
+            stream_push_tx_target_locked(stream, &target);
+        }
+
+        pthread_mutex_unlock(&stream->ringbuf.lock);
+        goto out;
+    }
+
+    struct timespec start;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    /* Previously accepted output precedes this call's target, even when
+     * the call itself cannot accept any new input before its deadline. */
+    if (stream->conv)
+    {
+        for (;;)
+        {
+            ret = stream_write_stopped(stream);
+
+            if (ret != RIG_OK) { goto out; }
+
+            if (!stream_conv_flush_pending(stream->conv, conv_tx_ring_sink,
+                                           stream)) { break; }
+
+            if (stream_write_deadline(&start, timeout_ms))
             {
-                *bytes_written = 0;
-                ret = -RIG_EIO;
+                ret = -RIG_ETIMEOUT;
                 goto out;
             }
 
@@ -2220,41 +2334,80 @@ int HAMLIB_API rig_stream_write(RIG *rig,
         }
     }
 
-    int ovr_before = stream->ringbuf.overrun_count;
-
-    if (stream->conv)
+    do
     {
-        /* Converted TX stream: the ring holds the backend-native format,
-         * so the client's bytes run through the pipeline on the way in. */
-        ssize_t consumed = stream_conv_process(stream->conv, buffer,
-                                               buffer_size, conv_ring_sink,
-                                               stream);
+        const unsigned char *next = (const unsigned char *)buffer + *bytes_written;
+        size_t remaining = buffer_size - *bytes_written;
+
+        if (stream->conv && remaining / frame_bytes > STREAM_CONV_CHUNK_FRAMES)
+        {
+            remaining = STREAM_CONV_CHUNK_FRAMES * frame_bytes;
+        }
+
+        ssize_t consumed;
+
+        if (have_target)
+        {
+            pthread_mutex_lock(&stream->ringbuf.lock);
+            ret = stream->ringbuf.closing ? -RIG_ENAVAIL
+                  : stream->ringbuf.failed ? -RIG_EIO : RIG_OK;
+
+            if (ret != RIG_OK)
+            {
+                pthread_mutex_unlock(&stream->ringbuf.lock);
+                goto out;
+            }
+
+            uint64_t position = stream->ringbuf.write_total / stream->frame_bytes
+                                + stream->skipped_samples;
+            consumed = stream->conv
+                       ? stream_conv_process(stream->conv, next, remaining,
+                                             conv_tx_ring_sink_locked, stream)
+                       : (ssize_t)stream_ringbuf_write_bounded_locked(
+                           &stream->ringbuf, next, remaining, frame_bytes);
+
+            /* The first accepted prefix and its target are published together. */
+            if (consumed > 0)
+            {
+                target.sample_index = position;
+                stream_push_tx_target_locked(stream, &target);
+                have_target = 0;
+            }
+
+            pthread_mutex_unlock(&stream->ringbuf.lock);
+        }
+        else
+        {
+            ret = stream_write_stopped(stream);
+
+            if (ret != RIG_OK) { goto out; }
+
+            consumed = stream->conv
+                       ? stream_conv_process(stream->conv, next, remaining,
+                                             conv_tx_ring_sink, stream)
+                       : (ssize_t)stream_ringbuf_write_bounded(&stream->ringbuf,
+                           next, remaining, frame_bytes);
+        }
 
         if (consumed < 0)
         {
-            rig_debug(RIG_DEBUG_ERR, "%s: conversion failed\n", __func__);
             ret = -RIG_EINVAL;
             goto out;
         }
 
-        *bytes_written = (size_t)consumed;
-    }
-    else
-    {
-        *bytes_written = stream_ringbuf_write(&stream->ringbuf, buffer,
-                                              buffer_size);
-    }
+        *bytes_written += (size_t)consumed;
 
-    /* A write that overwrote unread data is a local TX overrun: report it as a
-     * write-status event (the ring already counted it in overrun_count). */
-    if (stream->ringbuf.overrun_count != ovr_before)
-    {
-        struct rig_stream_write_status ev;
-        memset(&ev, 0, sizeof(ev));
-        ev.event = RIG_STREAM_WRITE_EVENT_OVERRUN;
-        ev.sample_index = rig_stream_get_samples_written(stream);
-        stream_record_write_status(stream, &ev, 0);
+        if (*bytes_written == buffer_size) { break; }
+
+        if (stream_write_deadline(&start, timeout_ms))
+        {
+            ret = *bytes_written ? RIG_OK : -RIG_ETIMEOUT;
+            break;
+        }
+
+        if (consumed == 0) { usleep(1000); }
     }
+    while (*bytes_written < buffer_size);
 
 out:
     stream_guard_leave(rig, stream);
@@ -2284,31 +2437,49 @@ int HAMLIB_API rig_stream_drain(RIG *rig,
 
     int ret = RIG_OK;
 
-    /* Use backend hook if available */
-    if (rig->caps->stream_drain)
-    {
-        ret = rig->caps->stream_drain(rig, stream, timeout_ms);
-        goto out;
-    }
-
-    /* Poll until ring buffer is empty or timeout expires */
     struct timespec start;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    while (stream_ringbuf_available(&stream->ringbuf) > 0)
+    for (;;)
     {
-        usleep(1000);  /* 1ms poll interval */
+        ret = stream_write_stopped(stream);
+
+        if (ret != RIG_OK) { goto out; }
+
+        int pending = stream->conv && !stream_type_is_rx(stream->config.type)
+                      ? stream_conv_finish(stream->conv, conv_tx_ring_sink, stream) : 0;
+
+        if (pending < 0)
+        {
+            ret = -RIG_EIO;
+            goto out;
+        }
 
         struct timespec now;
+
         clock_gettime(CLOCK_MONOTONIC, &now);
         long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000
                           + (now.tv_nsec - start.tv_nsec) / 1000000;
 
-        if (elapsed_ms >= timeout_ms)
+        if (!pending && stream_ringbuf_available(&stream->ringbuf) == 0)
+        {
+            if (rig->caps->stream_drain)
+            {
+                int remaining = timeout_ms < 0 ? -1
+                                : elapsed_ms < timeout_ms ? timeout_ms - (int)elapsed_ms : 0;
+                ret = rig->caps->stream_drain(rig, stream, remaining);
+            }
+
+            break;
+        }
+
+        if (timeout_ms >= 0 && elapsed_ms >= timeout_ms)
         {
             ret = -RIG_ETIMEOUT;
-            goto out;
+            break;
         }
+
+        usleep(1000);
     }
 
 out:

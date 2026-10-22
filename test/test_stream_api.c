@@ -29,6 +29,8 @@
 #include "acutest.h"
 #include "test_debug.h"
 #include "stream.h"
+#include "stream_convert.h"
+#include <math.h>
 #include "cache.h"
 #include <limits.h>
 #include <string.h>
@@ -744,6 +746,101 @@ void test_rate_ratio_limits(void)
     teardown_rig(rig);
 }
 
+#ifdef HAVE_SAMPLERATE
+void test_converted_tx_drain_and_cancel(void)
+{
+    RIG *rig = setup_rig(&stub_caps_ratio_stream);
+    TEST_ASSERT(rig != NULL);
+    struct rig_stream_caps session = stub_ratio_stream_caps[1];
+    session.sample_rates[0] = 48000;
+    TEST_ASSERT(stream_set_session_caps(rig, &session, 1) == RIG_OK);
+    TEST_ASSERT(rig_set_conf(rig, rig_token_lookup(rig,
+            "stream_resample_quality"), "fast") == RIG_OK);
+    struct rig_stream_config *cfg = rig_stream_config_alloc();
+    TEST_ASSERT(cfg != NULL);
+    cfg->type = RIG_STREAM_TYPE_AUDIO_TX;
+    cfg->format = RIG_STREAM_FORMAT_PCM_F32;
+    cfg->channels = 1;
+    cfg->sample_rate = 12000;
+    cfg->buffer_bytes = 64;
+    rig_stream_t *stream = NULL;
+    TEST_ASSERT(rig_stream_open(rig, cfg, &stream) == RIG_OK);
+    float input[4096], expected[16384], output[16384];
+
+    for (int i = 0; i < 4096; ++i) { input[i] = (float)(0.5 * sin(i * 0.03)); }
+
+    size_t expected_frames = 16384;
+    TEST_ASSERT(rig_stream_resample(input, 12000, expected, 48000,
+                                    4096, &expected_frames, 1, RIG_RESAMPLE_FAST) == 0);
+
+    for (int segment = 0; segment < 3; ++segment)
+    {
+        size_t accepted = 0, received = 0;
+        int partial = 0;
+
+        for (int i = 0; i < 10000 && accepted < sizeof(input); ++i)
+        {
+            size_t written = 0;
+            size_t remaining = sizeof(input) - accepted;
+            int ret = rig_stream_write(rig, stream,
+                                       (unsigned char *)input + accepted, remaining,
+                                       &written, 0, NULL);
+            TEST_ASSERT(ret == RIG_OK || ret == -RIG_ETIMEOUT);
+            TEST_ASSERT(written <= remaining);
+            partial |= written < remaining;
+            accepted += written;
+            TEST_ASSERT(received < sizeof(output));
+            received += stream_ringbuf_read(&stream->ringbuf,
+                                            (unsigned char *)output + received, sizeof(output) - received, 0);
+        }
+
+        TEST_CHECK(partial);
+        TEST_CHECK(accepted == sizeof(input));
+        int ret = -RIG_ETIMEOUT;
+
+        for (int i = 0; i < 10000 && ret == -RIG_ETIMEOUT; ++i)
+        {
+            ret = rig_stream_drain(rig, stream, 0);
+            TEST_ASSERT(ret == RIG_OK || ret == -RIG_ETIMEOUT);
+            size_t pending = stream_ringbuf_available(&stream->ringbuf);
+            TEST_ASSERT(pending <= sizeof(output) - received);
+
+            if (pending)
+            {
+                received += stream_ringbuf_read(&stream->ringbuf,
+                                                (unsigned char *)output + received, pending, 0);
+            }
+        }
+
+        TEST_CHECK(ret == RIG_OK);
+        TEST_CHECK(received == expected_frames * sizeof(float));
+
+        for (size_t i = 0; i < received / sizeof(float); ++i)
+        {
+            TEST_CHECK(fabs(output[i] - expected[i]) < 0.00001);
+        }
+
+        TEST_CHECK(rig_stream_drain(rig, stream, 0) == RIG_OK);
+        TEST_CHECK(stream_ringbuf_available(&stream->ringbuf) == 0);
+
+        if (segment == 1)
+        {
+            size_t written = 0;
+            TEST_ASSERT(rig_stream_write(rig, stream, input, sizeof(input),
+                                         &written, 0, NULL) == RIG_OK);
+            TEST_CHECK(written > 0 && written < sizeof(input));
+            TEST_CHECK(rig_stream_close(rig, stream) == RIG_OK);
+            TEST_ASSERT(rig_stream_open(rig, cfg, &stream) == RIG_OK);
+            TEST_CHECK(stream_ringbuf_available(&stream->ringbuf) == 0);
+        }
+    }
+
+    rig_stream_close(rig, stream);
+    rig_stream_config_free(cfg);
+    teardown_rig(rig);
+}
+#endif
+
 void test_caps_derived_channels(void)
 {
     RIG *rig = setup_rig(&stub_caps_mono_stream);
@@ -999,6 +1096,7 @@ void test_codec_frame_read_api(void)
     TEST_CHECK(stats.codec_frames == (uint64_t)(2 + 40 - drops));
     TEST_MSG("codec_frames %llu, expected %d",
              (unsigned long long)stats.codec_frames, 2 + 40 - drops);
+    TEST_CHECK(rig_stream_get_samples_written(st) == (2 + 40) * 480);
 
     /* Drain, then produce one more frame: its start index sits past the
      * dropped-frame hole and the read reports the loss. */
@@ -1012,6 +1110,7 @@ void test_codec_frame_read_api(void)
     TEST_CHECK(rig_stream_read(rig, st, buf, sizeof(buf), &got, 100,
                                &info) == RIG_OK);
     TEST_CHECK(info.dropped_samples == (uint32_t)drops * 480);
+    TEST_CHECK(info.sample_index == (2 + 40) * 480);
     TEST_MSG("dropped_samples %u", info.dropped_samples);
     TEST_CHECK((info.drop_flags & RIG_STREAM_DROP_OVERRUN) != 0);
 
@@ -1039,7 +1138,6 @@ void test_codec_frame_write_api(void)
 
     rig_stream_t *st = NULL;
     TEST_ASSERT(rig_stream_open(rig, cfg, &st) == RIG_OK && st != NULL);
-    rig_stream_config_free(cfg);
 
     uint8_t frame[180], buf[2048];
 
@@ -1103,6 +1201,219 @@ void test_codec_frame_write_api(void)
     TEST_CHECK(stats.overruns == 0);
     TEST_CHECK(stats.dropped_samples_overrun == 0);
 
+    TEST_CHECK(stats.codec_frames == (uint64_t)(2 + accepted));
+    TEST_CHECK(rig_stream_get_samples_written(st)
+               == (uint64_t)(2 + accepted) * 480);
+    TEST_CHECK(written == 0);
+
+    for (int i = 0; i < accepted; i++)
+    {
+        TEST_CHECK(stream_backend_read_frame(st, buf, sizeof(buf), &len,
+                                             &dur, &idx, 100) == RIG_OK);
+        TEST_CHECK(idx == (uint64_t)(2 + i) * 480);
+    }
+
+    TEST_CHECK(rig_stream_write(rig, st, frame, sizeof(frame), &written,
+                                100, &winfo) == RIG_OK);
+    TEST_CHECK(stream_backend_read_frame(st, buf, sizeof(buf), &len, &dur,
+                                         &idx, 100) == RIG_OK);
+    TEST_CHECK(idx == (uint64_t)(2 + accepted) * 480);
+    TEST_CHECK(rig_stream_get_stats(rig, st, &stats) == RIG_OK);
+    TEST_CHECK(stats.codec_frames == (uint64_t)(3 + accepted));
+    TEST_CHECK(rig_stream_get_samples_written(st)
+               == (uint64_t)(3 + accepted) * 480);
+
+    TEST_CHECK(rig_stream_close(rig, st) == RIG_OK);
+    st = NULL;
+    TEST_ASSERT(rig_stream_open(rig, cfg, &st) == RIG_OK && st != NULL);
+    accepted = 0;
+
+    do
+    {
+        ret = rig_stream_write(rig, st, frame, sizeof(frame), &written,
+                               0, &winfo);
+
+        if (ret == RIG_OK)
+        {
+            accepted++;
+        }
+    }
+    while (ret == RIG_OK && accepted < 20);
+
+    TEST_ASSERT(ret == -RIG_ETIMEOUT);
+    TEST_ASSERT(accepted > 0 && accepted < 20);
+    TEST_CHECK(rig_stream_get_samples_written(st) == (uint64_t)accepted * 480);
+
+    winfo.flags = RIG_STREAM_TIME_FLAG_SOB;
+    TEST_CHECK(rig_stream_write(rig, st, frame, sizeof(frame), &written,
+                                0, &winfo) == -RIG_ETIMEOUT);
+    TEST_CHECK(written == 0);
+    TEST_CHECK(st->tx_target_count == 0);
+    TEST_CHECK(rig_stream_write(rig, st, frame, 0, &written,
+                                0, &winfo) == -RIG_EINVAL);
+    TEST_CHECK(st->tx_target_count == 0);
+    TEST_CHECK(stream_backend_read_frame(st, buf, sizeof(buf), &len, &dur,
+                                         &idx, 0) == RIG_OK);
+    uint64_t target_index = rig_stream_get_samples_written(st);
+    TEST_CHECK(rig_stream_write(rig, st, frame, sizeof(frame), &written,
+                                0, &winfo) == RIG_OK);
+    TEST_CHECK(written == sizeof(frame));
+    struct rig_stream_tx_target target;
+    TEST_CHECK(rig_stream_pop_tx_target(st, UINT64_MAX, &target) == 1);
+    TEST_CHECK(target.sample_index == target_index);
+    TEST_CHECK(st->tx_target_count == 0);
+
+    uint64_t accepted_index = rig_stream_get_samples_written(st);
+    uint64_t accepted_frames = st->codec_frames;
+    size_t queued_bytes = stream_ringbuf_available(&st->ringbuf);
+    winfo.flags = RIG_STREAM_TIME_FLAG_EOB;
+    winfo.codec_frame_samples = 0;
+    TEST_CHECK(rig_stream_write(rig, st, frame, 0, &written, 0, &winfo)
+               == RIG_OK);
+    TEST_CHECK(written == 0);
+    TEST_CHECK(rig_stream_pop_tx_target(st, UINT64_MAX, &target) == 1);
+    TEST_CHECK(target.sample_index == accepted_index);
+    TEST_CHECK(target.flags == RIG_STREAM_TIME_FLAG_EOB);
+    TEST_CHECK(st->tx_target_count == 0);
+    TEST_CHECK(rig_stream_get_samples_written(st) == accepted_index);
+    TEST_CHECK(st->codec_frames == accepted_frames);
+    TEST_CHECK(stream_ringbuf_available(&st->ringbuf) == queued_bytes);
+
+    TEST_CHECK(rig_stream_write(rig, st, frame, 0, &written, 0, NULL)
+               == -RIG_EINVAL);
+    winfo.time_valid = 1;
+    TEST_CHECK(rig_stream_write(rig, st, frame, 0, &written, 0, &winfo)
+               == -RIG_ENAVAIL);
+    TEST_CHECK(st->tx_target_count == 0);
+    winfo.time_valid = 0;
+    stream_mark_failed(st, RIG_COMM_REASON_LINK_TIMEOUT);
+    TEST_CHECK(rig_stream_write(rig, st, frame, 0, &written, 0, &winfo)
+               == -RIG_EIO);
+    TEST_CHECK(st->tx_target_count == 0);
+
+    rig_stream_close(rig, st);
+    rig_stream_config_free(cfg);
+    teardown_rig(rig);
+}
+
+
+enum { CODEC_PUBLICATION_FRAMES = 4096 };
+
+struct codec_publication_ctx
+{
+    rig_stream_t *stream;
+    pthread_mutex_t lock;
+    pthread_cond_t consumed;
+    uint32_t acknowledged;
+    int stop;
+    int failed;
+};
+
+static void *codec_publication_producer(void *arg)
+{
+    struct codec_publication_ctx *ctx = arg;
+
+    for (uint32_t frame = 0; frame < CODEC_PUBLICATION_FRAMES; frame++)
+    {
+        if (stream_backend_write_frame(ctx->stream, &frame, sizeof(frame),
+                                       480) != (ssize_t)sizeof(frame))
+        {
+            ctx->failed = 1;
+            break;
+        }
+
+        pthread_mutex_lock(&ctx->lock);
+
+        while (ctx->acknowledged <= frame && !ctx->stop)
+        {
+            pthread_cond_wait(&ctx->consumed, &ctx->lock);
+        }
+
+        int stop = ctx->stop;
+        pthread_mutex_unlock(&ctx->lock);
+
+        if (stop)
+        {
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+
+/* Receiving a frame must imply that its production is already observable. */
+void test_codec_frame_publication(void)
+{
+    RIG *rig = setup_rig(&stub_caps_codec_stream);
+    TEST_ASSERT(rig != NULL);
+    struct rig_stream_config *cfg = rig_stream_config_alloc();
+    TEST_ASSERT(cfg != NULL);
+    cfg->type = RIG_STREAM_TYPE_AUDIO_RX;
+    cfg->format = RIG_STREAM_FORMAT_OPUS;
+    cfg->sample_rate = 48000;
+    cfg->channels = 1;
+
+    rig_stream_t *st = NULL;
+    TEST_ASSERT(rig_stream_open(rig, cfg, &st) == RIG_OK && st != NULL);
+    rig_stream_config_free(cfg);
+
+    struct codec_publication_ctx ctx = { .stream = st };
+    pthread_mutex_init(&ctx.lock, NULL);
+    pthread_cond_init(&ctx.consumed, NULL);
+    pthread_t producer;
+    TEST_ASSERT(pthread_create(&producer, NULL, codec_publication_producer,
+                               &ctx) == 0);
+
+    for (uint32_t frame = 0; frame < CODEC_PUBLICATION_FRAMES; frame++)
+    {
+        uint32_t payload = UINT32_MAX;
+        size_t got = 0;
+        struct rig_stream_read_info info;
+        int ret = rig_stream_read(rig, st, &payload, sizeof(payload), &got,
+                                  2000, &info);
+
+        if (!TEST_CHECK(ret == RIG_OK))
+        {
+            break;
+        }
+
+        /* Inspect before acknowledging: producer completion must not be
+         * what makes the consumed frame's accounting visible. */
+        struct rig_stream_stats stats;
+        TEST_CHECK(rig_stream_get_stats(rig, st, &stats) == RIG_OK);
+        uint64_t position = rig_stream_get_samples_written(st);
+        TEST_CHECK(stats.codec_frames >= (uint64_t)frame + 1);
+        TEST_MSG("read frame %u, codec_frames %llu", frame,
+                 (unsigned long long)stats.codec_frames);
+        TEST_CHECK(position >= info.sample_index + info.codec_frame_samples);
+        TEST_MSG("read frame %u, producer position %llu", frame,
+                 (unsigned long long)position);
+        TEST_CHECK(got == sizeof(payload) && payload == frame);
+        TEST_CHECK(info.sample_index == (uint64_t)frame * 480);
+        TEST_CHECK(info.codec_frame_samples == 480);
+
+        pthread_mutex_lock(&ctx.lock);
+        ctx.acknowledged = frame + 1;
+        pthread_cond_signal(&ctx.consumed);
+        pthread_mutex_unlock(&ctx.lock);
+    }
+
+    pthread_mutex_lock(&ctx.lock);
+    ctx.stop = 1;
+    pthread_cond_signal(&ctx.consumed);
+    pthread_mutex_unlock(&ctx.lock);
+    pthread_join(producer, NULL);
+    TEST_CHECK(ctx.failed == 0);
+    TEST_CHECK(ctx.acknowledged == CODEC_PUBLICATION_FRAMES);
+    struct rig_stream_stats stats;
+    TEST_CHECK(rig_stream_get_stats(rig, st, &stats) == RIG_OK);
+    TEST_CHECK(stats.codec_frames == CODEC_PUBLICATION_FRAMES);
+    TEST_CHECK(stats.overruns == 0);
+    TEST_CHECK(rig_stream_get_samples_written(st)
+               == (uint64_t)CODEC_PUBLICATION_FRAMES * 480);
+    pthread_cond_destroy(&ctx.consumed);
+    pthread_mutex_destroy(&ctx.lock);
     rig_stream_close(rig, st);
     teardown_rig(rig);
 }
@@ -2151,6 +2462,242 @@ void test_write_via_api(void)
     teardown_rig(rig);
 }
 
+void test_pcm_write_backpressure(void)
+{
+    RIG *rig = setup_rig(&stub_caps_ratio_stream);
+    TEST_ASSERT(rig != NULL);
+    struct rig_stream_caps session = stub_ratio_stream_caps[1];
+    session.formats = RIG_STREAM_FORMAT_PCM_S16;
+    session.sample_rates[0] = 48000;
+    TEST_ASSERT(stream_set_session_caps(rig, &session, 1) == RIG_OK);
+    struct rig_stream_config *cfg = rig_stream_config_alloc();
+    TEST_ASSERT(cfg != NULL);
+    cfg->type = RIG_STREAM_TYPE_AUDIO_TX;
+    cfg->format = RIG_STREAM_FORMAT_PCM_S16;
+    cfg->sample_rate = 48000;
+    cfg->channels = 1;
+    cfg->buffer_bytes = 64;
+    rig_stream_t *stream = NULL;
+    TEST_ASSERT(rig_stream_open(rig, cfg, &stream) == RIG_OK);
+    int16_t input[64], out[32];
+
+    for (int i = 0; i < 64; ++i) { input[i] = (int16_t)i; }
+
+    size_t n = 999;
+    TEST_CHECK(rig_stream_write(rig, stream, input, sizeof(input), &n, 0,
+                                NULL) == RIG_OK);
+    TEST_CHECK(n == sizeof(out));
+    TEST_CHECK(rig_stream_write(rig, stream, input + 32, sizeof(out), &n, 5,
+                                NULL) == -RIG_ETIMEOUT);
+    TEST_CHECK(n == 0);
+    TEST_CHECK(stream_ringbuf_read(&stream->ringbuf, out, sizeof(out),
+                                   0) == sizeof(out));
+    TEST_CHECK(memcmp(out, input, sizeof(out)) == 0);
+    TEST_CHECK(rig_stream_write(rig, stream, input + 32, sizeof(out), &n, 0,
+                                NULL) == RIG_OK);
+    TEST_CHECK(n == sizeof(out));
+    TEST_CHECK(stream_ringbuf_read(&stream->ringbuf, out, sizeof(out),
+                                   0) == sizeof(out));
+    TEST_CHECK(memcmp(out, input + 32, sizeof(out)) == 0);
+    TEST_CHECK(stream->ringbuf.overrun_count == 0);
+    TEST_CHECK(rig_stream_write(rig, stream, input, 3, &n, 0, NULL) == -RIG_EINVAL);
+    TEST_CHECK(n == 0);
+    rig_stream_close(rig, stream);
+    rig_stream_config_free(cfg);
+    teardown_rig(rig);
+}
+
+void test_pcm_target_publication(void)
+{
+    RIG *rig = setup_rig(&stub_caps_ratio_stream);
+    TEST_ASSERT(rig != NULL);
+    struct rig_stream_caps session = stub_ratio_stream_caps[1];
+    session.formats = RIG_STREAM_FORMAT_PCM_S16;
+    session.sample_rates[0] = 48000;
+    TEST_ASSERT(stream_set_session_caps(rig, &session, 1) == RIG_OK);
+    struct rig_stream_config *cfg = rig_stream_config_alloc();
+    TEST_ASSERT(cfg != NULL);
+    cfg->type = RIG_STREAM_TYPE_AUDIO_TX;
+    cfg->format = RIG_STREAM_FORMAT_PCM_S16;
+    cfg->sample_rate = 48000;
+    cfg->channels = 1;
+    cfg->buffer_bytes = 64;
+    rig_stream_t *st = NULL;
+    TEST_ASSERT(rig_stream_open(rig, cfg, &st) == RIG_OK);
+    int16_t input[64] = { 0 }, out[32];
+    size_t written;
+    struct rig_stream_write_info info = { 0 };
+    info.flags = RIG_STREAM_TIME_FLAG_SOB;
+    TEST_CHECK(rig_stream_write(rig, st, input, sizeof(input), &written,
+                                0, &info) == RIG_OK);
+    TEST_CHECK(written == 64);
+    TEST_CHECK(st->tx_target_count == 1);
+    TEST_CHECK(rig_stream_write(rig, st, input, 3, &written,
+                                0, &info) == -RIG_EINVAL);
+    TEST_CHECK(st->tx_target_count == 1);
+    TEST_CHECK(rig_stream_write(rig, st, input, sizeof(input), &written,
+                                0, &info) == -RIG_ETIMEOUT);
+    TEST_CHECK(written == 0);
+    TEST_CHECK(st->tx_target_count == 1);
+    TEST_CHECK(stream_ringbuf_read(&st->ringbuf, out, sizeof(out), 0) == 64);
+    TEST_CHECK(rig_stream_write(rig, st, input + 32, 64, &written,
+                                0, NULL) == RIG_OK);
+    TEST_CHECK(st->tx_target_count == 1);
+    struct rig_stream_tx_target target;
+    TEST_CHECK(rig_stream_pop_tx_target(st, UINT64_MAX, &target) == 1);
+    TEST_CHECK(target.sample_index == 0);
+    info.flags = RIG_STREAM_TIME_FLAG_EOB;
+    TEST_CHECK(rig_stream_write(rig, st, input, 0, &written, 0,
+                                &info) == RIG_OK);
+    TEST_CHECK(written == 0);
+    TEST_CHECK(rig_stream_pop_tx_target(st, UINT64_MAX, &target) == 1);
+    TEST_CHECK(target.sample_index == 64);
+    stream_mark_failed(st, RIG_COMM_REASON_LINK_TIMEOUT);
+    TEST_CHECK(rig_stream_write(rig, st, input, 2, &written, 0,
+                                &info) == -RIG_EIO);
+    TEST_CHECK(st->tx_target_count == 0);
+    rig_stream_close(rig, st);
+    rig_stream_config_free(cfg);
+    teardown_rig(rig);
+}
+
+void test_converted_target_follows_pending_output(void)
+{
+    RIG *rig = setup_rig(&stub_caps_ratio_stream);
+    TEST_ASSERT(rig != NULL);
+    struct rig_stream_caps session = stub_ratio_stream_caps[1];
+    session.sample_rates[0] = 48000;
+    TEST_ASSERT(stream_set_session_caps(rig, &session, 1) == RIG_OK);
+    struct rig_stream_config *cfg = rig_stream_config_alloc();
+    TEST_ASSERT(cfg != NULL);
+    cfg->type = RIG_STREAM_TYPE_AUDIO_TX;
+    cfg->format = RIG_STREAM_FORMAT_PCM_S16;
+    cfg->sample_rate = 48000;
+    cfg->channels = 1;
+    cfg->buffer_bytes = 64;
+    rig_stream_t *st = NULL;
+    TEST_ASSERT(rig_stream_open(rig, cfg, &st) == RIG_OK);
+    TEST_ASSERT(st->conv != NULL);
+    int16_t input[32];
+    float out[16];
+
+    for (int i = 0; i < 32; i++) { input[i] = (int16_t)(100 * i); }
+
+    size_t written;
+    TEST_CHECK(rig_stream_write(rig, st, input, sizeof(input), &written,
+                                0, NULL) == RIG_OK);
+    TEST_CHECK(written == sizeof(input));
+    struct rig_stream_write_info info = { 0 };
+    info.flags = RIG_STREAM_TIME_FLAG_EOB;
+    TEST_CHECK(rig_stream_write(rig, st, input, 0, &written, 0, &info) == RIG_OK);
+    TEST_CHECK(written == 0);
+    TEST_CHECK(stream_conv_pending_frames(st->conv) == 16);
+    struct rig_stream_tx_target pending_target;
+    TEST_CHECK(rig_stream_pop_tx_target(st, 16, &pending_target) == 0);
+    TEST_CHECK(rig_stream_pop_tx_target(st, 32, &pending_target) == 1);
+    TEST_CHECK(pending_target.sample_index == 32);
+    TEST_CHECK(rig_stream_write(rig, st, input, 2, &written, 0,
+                                &info) == -RIG_ETIMEOUT);
+    TEST_CHECK(written == 0);
+    TEST_CHECK(st->tx_target_count == 0);
+    TEST_CHECK(stream_ringbuf_read(&st->ringbuf, out, sizeof(out),
+                                   0) == sizeof(out));
+
+    for (int i = 0; i < 16; i++)
+    {
+        TEST_CHECK(fabs(out[i] - input[i] / 32768.0) < 0.00001);
+    }
+
+    TEST_CHECK(rig_stream_write(rig, st, input, 2, &written, 0,
+                                &info) == RIG_OK);
+    TEST_CHECK(written == 2);
+    struct rig_stream_tx_target target;
+    TEST_CHECK(rig_stream_pop_tx_target(st, UINT64_MAX, &target) == 1);
+    TEST_CHECK(target.sample_index == 32);
+    TEST_CHECK(rig_stream_drain(rig, st, 0) == -RIG_ETIMEOUT);
+    TEST_CHECK(rig_stream_write(rig, st, input, 2, &written, 0,
+                                &info) == -RIG_EINVAL);
+    TEST_CHECK(written == 0);
+    TEST_CHECK(st->tx_target_count == 0);
+    TEST_CHECK(stream_ringbuf_read(&st->ringbuf, out, sizeof(out),
+                                   0) == sizeof(out));
+
+    for (int i = 0; i < 16; i++)
+    {
+        TEST_CHECK(fabs(out[i] - input[16 + i] / 32768.0) < 0.00001);
+    }
+
+    TEST_CHECK(rig_stream_drain(rig, st, 0) == -RIG_ETIMEOUT);
+    TEST_CHECK(stream_ringbuf_read(&st->ringbuf, out, sizeof(out),
+                                   0) == sizeof(float));
+    TEST_CHECK(rig_stream_drain(rig, st, 0) == RIG_OK);
+    TEST_CHECK(rig_stream_drain(rig, st, 0) == RIG_OK);
+    TEST_CHECK(rig_stream_write(rig, st, input, 0, &written, 0,
+                                &info) == RIG_OK);
+    TEST_CHECK(rig_stream_pop_tx_target(st, UINT64_MAX, &target) == 1);
+    TEST_CHECK(target.sample_index == 33);
+    TEST_CHECK(rig_stream_write(rig, st, input, 2, &written, 0, NULL) == RIG_OK);
+    TEST_CHECK(written == 2);
+    rig_stream_close(rig, st);
+    rig_stream_config_free(cfg);
+    teardown_rig(rig);
+}
+
+
+struct partial_error_writer
+{
+    RIG *rig;
+    rig_stream_t *stream;
+    size_t written;
+    int result;
+};
+
+static void *write_until_failure(void *arg)
+{
+    struct partial_error_writer *ctx = arg;
+    int16_t input[64] = { 0 };
+    ctx->result = rig_stream_write(ctx->rig, ctx->stream, input, sizeof(input),
+                                   &ctx->written, 1000, NULL);
+    return NULL;
+}
+
+void test_pcm_partial_progress_on_failure(void)
+{
+    RIG *rig = setup_rig(&stub_caps_ratio_stream);
+    TEST_ASSERT(rig != NULL);
+    struct rig_stream_caps session = stub_ratio_stream_caps[1];
+    session.formats = RIG_STREAM_FORMAT_PCM_S16;
+    session.sample_rates[0] = 48000;
+    TEST_ASSERT(stream_set_session_caps(rig, &session, 1) == RIG_OK);
+    struct rig_stream_config *cfg = rig_stream_config_alloc();
+    TEST_ASSERT(cfg != NULL);
+    cfg->type = RIG_STREAM_TYPE_AUDIO_TX;
+    cfg->format = RIG_STREAM_FORMAT_PCM_S16;
+    cfg->sample_rate = 48000;
+    cfg->channels = 1;
+    cfg->buffer_bytes = 64;
+    rig_stream_t *st = NULL;
+    TEST_ASSERT(rig_stream_open(rig, cfg, &st) == RIG_OK);
+    struct partial_error_writer ctx = { rig, st, 0, 999 };
+    pthread_t thread;
+    TEST_ASSERT(pthread_create(&thread, NULL, write_until_failure, &ctx) == 0);
+
+    for (int i = 0; i < 500 && stream_ringbuf_available(&st->ringbuf) != 64; i++)
+    {
+        usleep(1000);
+    }
+
+    TEST_CHECK(stream_ringbuf_available(&st->ringbuf) == 64);
+    stream_mark_failed(st, RIG_COMM_REASON_LINK_TIMEOUT);
+    pthread_join(thread, NULL);
+    TEST_CHECK(ctx.result == -RIG_EIO);
+    TEST_CHECK(ctx.written == 64);
+    rig_stream_close(rig, st);
+    rig_stream_config_free(cfg);
+    teardown_rig(rig);
+}
+
+
 void test_flush(void)
 {
     RIG *rig = setup_rig(&stub_caps_with_stream);
@@ -3082,8 +3629,15 @@ void test_session_caps_narrow_only_the_served_view(void)
 
 TEST_LIST =
 {
+    { "pcm_target_publication", test_pcm_target_publication },
+    { "pcm_partial_progress_on_failure", test_pcm_partial_progress_on_failure },
+    { "converted_target_follows_pending_output", test_converted_target_follows_pending_output },
     { "get_stream_caps_none",     test_get_stream_caps_none },
     { "stream_conf_tokens",       test_stream_conf_tokens },
+#ifdef HAVE_SAMPLERATE
+    { "converted_tx_drain_and_cancel", test_converted_tx_drain_and_cancel },
+#endif
+    { "pcm_write_backpressure", test_pcm_write_backpressure },
     { "get_stream_caps",          test_get_stream_caps },
     { "caps_derived_formats",     test_caps_derived_formats },
     { "caps_derived_rates",       test_caps_derived_rates },
@@ -3095,6 +3649,7 @@ TEST_LIST =
     { "codec_format_native_only", test_codec_format_native_only },
     { "codec_frame_read_api",     test_codec_frame_read_api },
     { "codec_frame_write_api",    test_codec_frame_write_api },
+    { "codec_frame_publication",  test_codec_frame_publication },
     { "caps_codec_only_not_widened", test_caps_codec_only_not_widened },
     { "caps_pre_open_raw",        test_caps_pre_open_raw },
     { "conversions_getter",       test_conversions_getter },

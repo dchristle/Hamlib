@@ -1319,6 +1319,68 @@ int rigctld_stream_emit_write_status(struct rigctld_stream *stream,
 }
 
 
+int rigctld_stream_write_payload(struct rigctld_stream *stream,
+                                 const void *data, size_t len,
+                                 const struct rig_stream_write_info *info)
+{
+    struct rig_stream *backend = stream->backend_stream;
+    size_t written = 0;
+    int ret = rig_stream_write(stream->rig, backend, data, len, &written, 0,
+                               info);
+    size_t frame_bytes = (size_t)rig_stream_format_sample_size(
+                             stream->config.format)
+                         * stream->config.channels;
+
+    int discarded = (ret == RIG_OK || ret == -RIG_ETIMEOUT) && written < len;
+
+    /* A discarded datagram may still carry the only burst boundary. Accept
+     * that boundary explicitly, without pretending its samples were queued. */
+    if (discarded && written == 0
+            && info && (info->time_valid || info->flags))
+    {
+        struct rig_stream_write_info marker_info = *info;
+        marker_info.codec_frame_samples = 0;
+        size_t marker_written = 0;
+        int marker_ret = rig_stream_write(stream->rig, backend, data, 0,
+                                          &marker_written, 0, &marker_info);
+
+        if (marker_ret != RIG_OK) { ret = marker_ret; }
+    }
+
+    if (discarded)
+    {
+        struct rig_stream_write_status ev = { 0 };
+        ev.event = RIG_STREAM_WRITE_EVENT_OVERRUN;
+        ev.sample_index = rig_stream_get_samples_written(backend);
+
+        /* The event uses backend sample units; rate conversion does not
+         * expose an exact output-frame count for input never accepted. */
+        if (!backend->is_codec && frame_bytes
+                && stream->config.sample_rate == backend->backend_config.sample_rate)
+        {
+            ev.dropped_samples = (uint32_t)((len - written) / frame_bytes);
+        }
+
+        pthread_mutex_lock(&backend->ringbuf.lock);
+        backend->ringbuf.overrun_count++;
+        backend->dropped_samples_overrun += ev.dropped_samples;
+        pthread_mutex_unlock(&backend->ringbuf.lock);
+        stream_record_write_status(backend, &ev, 0);
+        rig_debug(RIG_DEBUG_WARN,
+                  "%s: stream %d discarded %zu of %zu TX input bytes\n",
+                  __func__, stream->stream_id, len - written, len);
+    }
+
+    /* This is the received input timeline, including discarded samples. */
+    if (!backend->is_codec && frame_bytes)
+    {
+        stream->timestamp += len / frame_bytes;
+    }
+
+    return ret;
+}
+
+
 /* Drain the backend stream's write-status event FIFO and forward each event to
  * the client with its full per-event detail. */
 static void poll_and_emit_write_status(struct rigctld_stream *stream)
@@ -1394,10 +1456,6 @@ static void *rigctld_stream_feeder_tx(void *arg)
     {
         stream->sample_size = 1;
     }
-
-    int sample_size = stream->sample_size;
-    int channels = stream->config.channels > 0 ? stream->config.channels : 1;
-    int frame_bytes = sample_size * channels;
 
     while (stream->running)
     {
@@ -1599,10 +1657,8 @@ static void *rigctld_stream_feeder_tx(void *arg)
 
             if (data_len > 0 || winfo_ptr)
             {
-                size_t bytes_written;
-                int wret = rig_stream_write(stream->rig, stream->backend_stream,
-                                            data, data_len, &bytes_written, 0,
-                                            winfo_ptr);
+                int wret = rigctld_stream_write_payload(stream, data, data_len,
+                                                        winfo_ptr);
 
                 if (wret == -RIG_EIO)
                 {
@@ -1619,13 +1675,6 @@ static void *rigctld_stream_feeder_tx(void *arg)
                     }
                 }
 
-                /* Advance the sample counter by whole frames (all
-                 * channels); codec frame durations are not on the wire,
-                 * so a codec TX position stays byte-agnostic (0). */
-                if (!stream->backend_stream->is_codec)
-                {
-                    stream->timestamp += data_len / frame_bytes;
-                }
             }
         }
 

@@ -34,6 +34,8 @@
 #include <math.h>
 
 #include "stream_time.h"
+#include "stream.h"
+#include "stream_convert.h"
 
 /* Access dummy backend private data for mode configuration */
 #include "../rigs/dummy/dummy.h"
@@ -2801,75 +2803,49 @@ void test_timed_tx_late_counter(void)
 }
 
 
-/* Direct-mode OVERRUN: a write far larger than the ring overwrites unread data;
- * the frontend reports a local (non-REMOTE) OVERRUN write-status event and the
- * aggregate stat counts it locally. */
-void test_tx_write_overrun_direct(void)
+/* A paused consumer backpressures the producer without losing queued PCM. */
+void test_tx_write_backpressure_direct(void)
 {
     RIG *rig = open_dummy();
     TEST_ASSERT(rig != NULL);
-
     struct rig_stream_config *config = rig_stream_config_alloc();
     TEST_ASSERT(config != NULL);
     config->type = RIG_STREAM_TYPE_AUDIO_TX;
     config->format = RIG_STREAM_FORMAT_PCM_S16;
     config->sample_rate = 48000;
     config->channels = 1;
-    config->buffer_bytes = 1024;   /* tiny ring to force an overrun */
+    config->buffer_bytes = 1024;
     rig_stream_t *stream = NULL;
     TEST_ASSERT(rig_stream_open(rig, config, &stream) == RIG_OK);
-
-    /* the stream copied the config; releasing it here is safe */
     rig_stream_config_free(config);
-
-    /* Pause the consumer so unread data accumulates, then write past the ring
-     * capacity — later writes overwrite unread bytes => overrun. */
     rig_stream_pause(rig, stream);
-
-    /* No settle: the consumer re-reads `paused` only at the top of its loop,
-     * after a blocking ring read and its pacing sleep, so no amount of
-     * waiting here proves it has parked -- it can still take one frame after
-     * the pause. The burst below is four times the ring, which overruns
-     * whether or not that frame is taken, so the test does not need it to. */
-
-    int16_t burst[512];   /* 1024 bytes = the whole ring */
-    memset(burst, 0, sizeof(burst));
+    int16_t burst[512] = { 0 };
+    int backpressured = 0;
 
     for (int i = 0; i < 4; i++)
     {
         size_t written = 0;
-        TEST_ASSERT(rig_stream_write(rig, stream, burst, sizeof(burst),
-                                     &written, 100, NULL) == RIG_OK);
-    }
+        int ret = rig_stream_write(rig, stream, burst, sizeof(burst),
+                                   &written, 100, NULL);
 
-    rig_stream_resume(rig, stream);
-
-    int got_overrun = 0;
-
-    for (int i = 0; i < 10 && !got_overrun; i++)
-    {
-        struct rig_stream_write_status ev;
-        memset(&ev, 0, sizeof(ev));
-
-        if (rig_stream_wait_write_status(rig, stream, &ev, 300) != RIG_OK)
+        if (ret == -RIG_ETIMEOUT)
         {
+            TEST_CHECK(written == 0);
+            backpressured = 1;
             break;
         }
 
-        if (ev.event == RIG_STREAM_WRITE_EVENT_OVERRUN)
-        {
-            got_overrun = 1;
-            TEST_CHECK((ev.flags & RIG_STREAM_WRITE_STATUS_REMOTE) == 0);
-        }
+        TEST_CHECK(ret == RIG_OK);
+        TEST_CHECK(written > 0 && written <= sizeof(burst));
     }
 
-    TEST_CHECK_(got_overrun, "no local OVERRUN event surfaced");
-
+    TEST_CHECK(backpressured);
     struct rig_stream_stats stats;
     rig_stream_get_stats(rig, stream, &stats);
-    TEST_CHECK_(stats.overruns >= 1, "overruns=%u", stats.overruns);
+    TEST_CHECK(stats.overruns == 0);
     TEST_CHECK(stats.remote_overruns == 0);
-
+    rig_stream_resume(rig, stream);
+    TEST_CHECK(rig_stream_drain(rig, stream, 1000) == RIG_OK);
     rig_stream_close(rig, stream);
     close_dummy(rig);
 }
@@ -2938,6 +2914,105 @@ void test_timed_tx_gates_and_keys_ptt(void)
 
     TEST_CHECK_(unkeyed, "PTT never released after EOB");
 
+    rig_stream_close(rig, stream);
+    close_dummy(rig);
+}
+
+
+void test_timed_tx_rechecks_target_after_wait(void)
+{
+    RIG *rig = open_dummy();
+    TEST_ASSERT(rig != NULL);
+    struct rig_stream_config *cfg = rig_stream_config_alloc();
+    TEST_ASSERT(cfg != NULL);
+    cfg->type = RIG_STREAM_TYPE_AUDIO_TX;
+    cfg->format = RIG_STREAM_FORMAT_PCM_S16;
+    cfg->sample_rate = 48000;
+    cfg->channels = 1;
+    rig_stream_t *stream = NULL;
+    TEST_ASSERT(rig_stream_open(rig, cfg, &stream) == RIG_OK);
+    rig_stream_config_free(cfg);
+    usleep(50000);
+    struct rig_stream_write_info info = { 0 };
+    info.time_valid = 1;
+    info.flags = RIG_STREAM_TIME_FLAG_SOB;
+    stream_time_now(&info.seconds, &info.picoseconds);
+    info.picoseconds += 300ULL * 1000000000ULL;
+    stream_time_normalize(&info.seconds, &info.picoseconds);
+    int16_t samples[480] = { 0 };
+    size_t written;
+    TEST_CHECK(rig_stream_write(rig, stream, samples, sizeof(samples), &written,
+                                0, &info) == RIG_OK);
+    usleep(100000);
+    TEST_CHECK(stream_ringbuf_available(&stream->ringbuf)
+               == 480 * (size_t)stream->frame_bytes);
+
+    for (int i = 0; i < 100 && stream_ringbuf_available(&stream->ringbuf); i++)
+    {
+        usleep(10000);
+    }
+
+    TEST_CHECK(stream_ringbuf_available(&stream->ringbuf) == 0);
+    ptt_t ptt = RIG_PTT_OFF;
+    rig_get_ptt(rig, RIG_VFO_CURR, &ptt);
+    TEST_CHECK(ptt == RIG_PTT_ON);
+    memset(&info, 0, sizeof(info));
+    info.flags = RIG_STREAM_TIME_FLAG_EOB;
+    TEST_CHECK(rig_stream_write(rig, stream, samples, 0, &written, 0,
+                                &info) == RIG_OK);
+
+    for (int i = 0; i < 100 && ptt != RIG_PTT_OFF; i++)
+    {
+        usleep(10000);
+        rig_get_ptt(rig, RIG_VFO_CURR, &ptt);
+    }
+
+    TEST_CHECK(ptt == RIG_PTT_OFF);
+    rig_stream_close(rig, stream);
+    close_dummy(rig);
+}
+
+
+void test_future_eob_waits_for_pending_conversion(void)
+{
+    RIG *rig = open_dummy();
+    TEST_ASSERT(rig != NULL);
+    struct rig_stream_config *cfg = rig_stream_config_alloc();
+    TEST_ASSERT(cfg != NULL);
+    cfg->type = RIG_STREAM_TYPE_AUDIO_TX;
+    cfg->format = RIG_STREAM_FORMAT_PCM_S8;
+    cfg->sample_rate = 48000;
+    cfg->channels = 1;
+    cfg->buffer_bytes = 64;
+    rig_stream_t *stream = NULL;
+    TEST_ASSERT(rig_stream_open(rig, cfg, &stream) == RIG_OK);
+    rig_stream_config_free(cfg);
+    TEST_ASSERT(stream->conv != NULL);
+    TEST_CHECK(rig_stream_pause(rig, stream) == RIG_OK);
+    usleep(150000);
+    int8_t samples[64] = { 0 };
+    size_t written;
+    TEST_CHECK(rig_stream_write(rig, stream, samples, sizeof(samples), &written,
+                                0, NULL) == RIG_OK);
+    TEST_CHECK(written == sizeof(samples));
+    TEST_ASSERT(stream_conv_pending_frames(stream->conv) > 0);
+    struct rig_stream_write_info info = { 0 };
+    info.flags = RIG_STREAM_TIME_FLAG_EOB;
+    TEST_CHECK(rig_stream_write(rig, stream, samples, 0, &written, 0,
+                                &info) == RIG_OK);
+    rig_set_ptt(rig, RIG_VFO_CURR, RIG_PTT_ON);
+    TEST_CHECK(rig_stream_resume(rig, stream) == RIG_OK);
+    usleep(200000);
+    TEST_CHECK(stream_ringbuf_available(&stream->ringbuf) == 0);
+    ptt_t ptt = RIG_PTT_OFF;
+    rig_get_ptt(rig, RIG_VFO_CURR, &ptt);
+    TEST_CHECK(ptt == RIG_PTT_ON);
+    pthread_mutex_lock(&stream->ringbuf.lock);
+    TEST_CHECK(stream->tx_target_count == 1);
+    pthread_mutex_unlock(&stream->ringbuf.lock);
+    TEST_CHECK(rig_stream_drain(rig, stream, 1000) == RIG_OK);
+    rig_get_ptt(rig, RIG_VFO_CURR, &ptt);
+    TEST_CHECK(ptt == RIG_PTT_OFF);
     rig_stream_close(rig, stream);
     close_dummy(rig);
 }
@@ -3453,8 +3528,10 @@ TEST_LIST =
     { "rx_time_info",                          test_rx_time_info },
     { "synthetic_gap_reporting",               test_synthetic_gap_reporting },
     { "timed_tx_late_counter",                 test_timed_tx_late_counter },
-    { "tx_write_overrun_direct",               test_tx_write_overrun_direct },
+    { "tx_write_backpressure_direct",          test_tx_write_backpressure_direct },
     { "timed_tx_gates_and_keys_ptt",           test_timed_tx_gates_and_keys_ptt },
+    { "timed_tx_rechecks_target_after_wait", test_timed_tx_rechecks_target_after_wait },
+    { "future_eob_waits_for_pending_conversion", test_future_eob_waits_for_pending_conversion },
     { "timed_tx_horizon_rejected",             test_timed_tx_horizon_rejected },
     { NULL, NULL }
 };

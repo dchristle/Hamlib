@@ -826,7 +826,6 @@ int rig_stream_resample(const float *src, int src_rate,
 /* ------------------------------------------------------------------ */
 
 /* Frames processed per pipeline pass; bounds scratch working-set growth. */
-#define STREAM_CONV_CHUNK_FRAMES 1024
 #define STREAM_CONV_MAX_SCRATCH_BYTES (16U * 1024U * 1024U)
 
 struct stream_conv
@@ -842,6 +841,14 @@ struct stream_conv
     unsigned char *buf_a;           /* ping-pong scratch */
     unsigned char *buf_b;
     size_t buf_bytes;
+    const unsigned char *pending;
+    size_t pending_bytes;
+    enum
+    {
+        STREAM_CONV_RUNNING,
+        STREAM_CONV_FINISHING,
+        STREAM_CONV_FINISHED
+    } state;
 #ifdef HAVE_SAMPLERATE
     SRC_STATE *src_state;           /* stateful resampler, NULL if no rate conv */
 #endif
@@ -1039,8 +1046,10 @@ void stream_conv_free(struct stream_conv *c)
  * to the bytes offered, or returns (size_t)-1 on conversion error. */
 static size_t conv_run_slice(struct stream_conv *c, const unsigned char *in,
                              size_t in_frames, stream_conv_sink_fn sink,
-                             void *ctx, size_t *out_bytes_total)
+                             void *ctx, size_t *out_bytes_total,
+                             size_t *in_frames_used)
 {
+    *in_frames_used = in_frames;
     /* Ping-pong: each stage reads cur and writes other, then swaps. The
      * external input is never written, so the first stage lands in buf_a. */
     const unsigned char *cur = in;
@@ -1104,6 +1113,7 @@ static size_t conv_run_slice(struct stream_conv *c, const unsigned char *in,
             return (size_t)-1;
         }
 
+        *in_frames_used = (size_t)data.input_frames_used;
         cur = other;
         other = (other == c->buf_a) ? c->buf_b : c->buf_a;
         frames = (size_t)data.output_frames_gen;
@@ -1134,16 +1144,55 @@ static size_t conv_run_slice(struct stream_conv *c, const unsigned char *in,
         return 0;  /* resampler primed but produced nothing yet */
     }
 
-    return sink(ctx, cur, out_bytes);
+    size_t accepted = sink(ctx, cur, out_bytes);
+
+    if (accepted < out_bytes)
+    {
+        if (cur != c->buf_a && cur != c->buf_b)
+        {
+            memcpy(c->buf_a, cur, out_bytes);
+            cur = c->buf_a;
+        }
+
+        c->pending = cur + accepted;
+        c->pending_bytes = out_bytes - accepted;
+    }
+
+    return accepted;
+}
+
+int stream_conv_is_finishing(const struct stream_conv *c)
+{
+    return c && c->state == STREAM_CONV_FINISHING;
+}
+
+size_t stream_conv_pending_frames(const struct stream_conv *c)
+{
+    return c ? c->pending_bytes / c->dst_frame_bytes : 0;
 }
 
 ssize_t stream_conv_process(struct stream_conv *c, const void *buf,
                             size_t len, stream_conv_sink_fn sink, void *ctx)
 {
-    if (!c || !buf || !sink || len % c->src_frame_bytes != 0)
+    if (!c || !buf || !sink || stream_conv_is_finishing(c)
+            || len % c->src_frame_bytes != 0)
     {
         return -1;
     }
+
+    if (len == 0) { return 0; }
+
+    if (c->state == STREAM_CONV_FINISHED)
+    {
+#ifdef HAVE_SAMPLERATE
+
+        if (c->src_state && src_reset(c->src_state) != 0) { return -1; }
+
+#endif
+        c->state = STREAM_CONV_RUNNING;
+    }
+
+    if (stream_conv_flush_pending(c, sink, ctx) != 0) { return 0; }
 
     const unsigned char *in = buf;
     size_t frames_left = len / c->src_frame_bytes;
@@ -1154,26 +1203,97 @@ ssize_t stream_conv_process(struct stream_conv *c, const void *buf,
         size_t slice = frames_left > STREAM_CONV_CHUNK_FRAMES
                        ? STREAM_CONV_CHUNK_FRAMES : frames_left;
         size_t offered = 0;
-        size_t accepted = conv_run_slice(c, in, slice, sink, ctx, &offered);
+        size_t used = 0;
+        size_t accepted = conv_run_slice(c, in, slice, sink, ctx, &offered,
+                                         &used);
 
-        if (accepted == (size_t)-1)
+        if (accepted == (size_t) -1)
         {
             return -1;
         }
 
         if (accepted < offered)
         {
-            /* Sink stopped early (ring full / timeout): credit the input
-             * proportionally so the caller can report partial progress. */
-            consumed_frames += offered != 0
-                               ? slice * accepted / offered : 0;
+            consumed_frames += used;
             return (ssize_t)(consumed_frames * c->src_frame_bytes);
         }
 
-        consumed_frames += slice;
-        in += slice * c->src_frame_bytes;
-        frames_left -= slice;
+        consumed_frames += used;
+        in += used * c->src_frame_bytes;
+        frames_left -= used;
+
+        if (used == 0 && offered == 0) { break; }
     }
 
     return (ssize_t)(consumed_frames * c->src_frame_bytes);
+}
+
+int stream_conv_flush_pending(struct stream_conv *c,
+                              stream_conv_sink_fn sink, void *ctx)
+{
+    if (c->pending_bytes)
+    {
+        size_t n = sink(ctx, c->pending, c->pending_bytes);
+        c->pending += n;
+        c->pending_bytes -= n;
+    }
+
+    return c->pending_bytes != 0;
+}
+
+int stream_conv_finish(struct stream_conv *c,
+                       stream_conv_sink_fn sink, void *ctx)
+{
+    if (!c || !sink) { return -1; }
+
+    if (c->state == STREAM_CONV_FINISHED) { return 0; }
+
+    c->state = STREAM_CONV_FINISHING;
+
+    if (stream_conv_flush_pending(c, sink, ctx)) { return 1; }
+
+#ifdef HAVE_SAMPLERATE
+
+    if (c->src_state)
+    {
+        for (;;)
+        {
+            SRC_DATA data = { 0 };
+            data.data_in = (float *)c->buf_b;
+            data.data_out = (float *)c->buf_a;
+            data.output_frames = (long)c->out_cap_frames;
+            data.src_ratio = (double)c->dst_rate / (double)c->src_rate;
+            data.end_of_input = 1;
+
+            if (src_process(c->src_state, &data) != 0) { return -1; }
+
+            if (data.output_frames_gen == 0)
+            {
+                break;
+            }
+
+            size_t frames = (size_t)data.output_frames_gen;
+            const unsigned char *output = c->buf_a;
+
+            if (c->dst_fmt != c->pivot_fmt)
+            {
+                if (rig_stream_convert(c->buf_a, c->pivot_fmt,
+                                       c->buf_b, c->dst_fmt, frames, c->dst_ch) != 0)
+                {
+                    return -1;
+                }
+
+                output = c->buf_b;
+            }
+
+            c->pending = output;
+            c->pending_bytes = frames * c->dst_frame_bytes;
+
+            if (stream_conv_flush_pending(c, sink, ctx)) { return 1; }
+        }
+    }
+
+#endif
+    c->state = STREAM_CONV_FINISHED;
+    return 0;
 }

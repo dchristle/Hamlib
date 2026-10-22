@@ -167,21 +167,68 @@ size_t stream_ringbuf_write(struct rig_stream_ringbuf *rb,
 }
 
 
+size_t stream_ringbuf_write_bounded(struct rig_stream_ringbuf *rb,
+                                    const void *data, size_t len,
+                                    size_t frame_bytes)
+{
+    pthread_mutex_lock(&rb->lock);
+    size_t written = stream_ringbuf_write_bounded_locked(rb, data, len,
+        frame_bytes);
+    pthread_mutex_unlock(&rb->lock);
+    return written;
+}
+
+size_t stream_ringbuf_write_bounded_locked(struct rig_stream_ringbuf *rb,
+        const void *data, size_t len,
+        size_t frame_bytes)
+{
+    size_t room = rb->capacity - rb->count;
+
+    if (len > room) { len = room; }
+
+    len -= len % frame_bytes;
+
+    if (rb->closing || rb->failed) { len = 0; }
+
+    size_t first = rb->capacity - rb->write_pos;
+
+    if (first > len) { first = len; }
+
+    memcpy(rb->buffer + rb->write_pos, data, first);
+    memcpy(rb->buffer, (const unsigned char *)data + first, len - first);
+    rb->write_pos = (rb->write_pos + len) & (rb->capacity - 1);
+    rb->count += len;
+    rb->write_total += len;
+
+    if (len) { pthread_cond_signal(&rb->data_available); }
+
+    return len;
+}
+
+
 size_t stream_ringbuf_write_record(struct rig_stream_ringbuf *rb,
                                    const void *hdr, size_t hdr_len,
                                    const void *payload, size_t len)
 {
-    size_t total = hdr_len + len;
-
     pthread_mutex_lock(&rb->lock);
+    size_t written = stream_ringbuf_write_record_locked(rb, hdr, hdr_len,
+        payload, len);
+    pthread_mutex_unlock(&rb->lock);
+    return written;
+}
+
+size_t stream_ringbuf_write_record_locked(struct rig_stream_ringbuf *rb,
+        const void *hdr, size_t hdr_len,
+        const void *payload, size_t len)
+{
+    size_t total = hdr_len + len;
 
     /* All or nothing: a partial record would strand the reader mid-frame,
      * and overwriting the oldest bytes would destroy record alignment.
      * No overrun counting here — a retrying TX writer polls this path,
      * so the caller decides whether a failure is a real drop. */
-    if (total > rb->capacity - rb->count)
+    if (rb->closing || rb->failed || total > rb->capacity - rb->count)
     {
-        pthread_mutex_unlock(&rb->lock);
         return 0;
     }
 
@@ -211,7 +258,6 @@ size_t stream_ringbuf_write_record(struct rig_stream_ringbuf *rb,
     }
 
     pthread_cond_signal(&rb->data_available);
-    pthread_mutex_unlock(&rb->lock);
 
     return total;
 }

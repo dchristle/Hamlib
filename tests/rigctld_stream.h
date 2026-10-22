@@ -326,6 +326,11 @@ int rigctld_stream_send_control_reply(struct rigctld_stream *stream,
  * Returns 0 on success, -1 on failure. */
 int rigctld_stream_send_error(struct rigctld_stream *stream);
 
+/* Accept one TX datagram payload and report any discarded suffix. */
+int rigctld_stream_write_payload(struct rigctld_stream *stream,
+                                 const void *data, size_t len,
+                                 const struct rig_stream_write_info *info);
+
 /* Forward one write-status event to the client as a WRITE_STATUS packet.
  * The TX feeder normally drains these from the backend stream's event FIFO;
  * exposed as a thin seam for tests. Returns 0 on success. */

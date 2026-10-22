@@ -2252,9 +2252,9 @@ struct rig_stream_write_info {
 /* Stream health snapshot returned by rig_stream_get_stats() */
 struct rig_stream_stats {
     /* event counts (local) */
-    uint32_t overruns;          /* local overrun: ring full on write (oldest
-                                   overwritten), or a backend receive queue
-                                   that overflowed before the ring */
+    uint32_t overruns;          /* local data loss: ring overwrite, discarded
+                                   TX datagram suffix, or backend receive
+                                   queue overflow */
     uint32_t underruns;         /* local blocking read timed out empty */
     uint32_t gaps;              /* radio/network-side gaps marked by backend */
     uint32_t gaps_unknown;      /* subset of gaps with unknown size */
@@ -3763,10 +3763,20 @@ rig_stream_read(RIG *rig,
  * rig_stream_read(). \a *bytes_written is set to the accepted byte count. \a
  * info, when non-NULL, carries a timed-burst target (seconds/picoseconds) and
  * SOB/EOB flags. A muted stream accepts the write for pacing but discards the
- * samples (nothing is transmitted).
+ * samples (nothing is transmitted). PCM writes preserve unread samples and
+ * may accept a whole-frame prefix; retry only the unaccepted suffix. A full
+ * ring with no progress returns -RIG_ETIMEOUT. Conversion may retain one
+ * bounded slice of accepted output until the ring has space. The accepted
+ * count remains valid on a later error; never resend that prefix. Metadata
+ * belongs to the first accepted prefix and must not be repeated when retrying
+ * its suffix. Zero-length PCM writes may publish metadata after all accepted
+ * output, including retained conversion output, without waiting for ring space.
+ * Zero-length codec writes require a target and codec_frame_samples == 0;
+ * they publish at the accepted decoded-sample position without queuing a frame.
+ * Use one writer per stream and do not write concurrently with drain.
  *
- * \return RIG_OK, or a negative error (-RIG_EINVAL on bad args, -RIG_ENAVAIL
- *         if timed TX is requested but unsupported).
+ * \return RIG_OK on partial or full progress, or a negative error
+ *         (-RIG_EINVAL on bad args, -RIG_ENAVAIL if timed TX is unsupported).
  */
 extern HAMLIB_EXPORT(int)
 rig_stream_write(RIG *rig,
@@ -3778,12 +3788,16 @@ rig_stream_write(RIG *rig,
                  const struct rig_stream_write_info *info);
 
 /*!
- * \brief Block until the TX ring drains or \a timeout_ms elapses.
+ * \brief Finish a TX segment and wait for its ring and backend to drain.
  *
- * \a timeout_ms > 0 bounds the wait; 0 returns immediately. Default
- * implementation polls the ring; a backend may flush a hardware FIFO instead.
+ * \a timeout_ms > 0 bounds the wait; 0 returns immediately and < 0 waits
+ * indefinitely. TX drain ends the current conversion segment, including the
+ * resampler filter tail, before the ring and backend drain. After a timeout,
+ * retry drain or close to discard; write again only after successful drain.
+ * Subsequent writes start a fresh conversion segment. Network completion
+ * need not imply radio playout; backend completion guarantees still apply.
  *
- * \return RIG_OK when drained, -RIG_ETIMEOUT otherwise, -RIG_EINVAL on bad args.
+ * \return RIG_OK when drained, -RIG_ETIMEOUT on timeout, or a negative error.
  */
 extern HAMLIB_EXPORT(int)
 rig_stream_drain(RIG *rig,
