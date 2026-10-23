@@ -392,7 +392,8 @@ static int stream_rate_list_max(const int *rates)
     return max;
 }
 
-static int stream_rate_source(const int *native_rates, int requested_rate);
+static int stream_rate_source(const int *native_rates, int requested_rate,
+                              int is_rx);
 
 #endif /* HAVE_SAMPLERATE */
 
@@ -516,20 +517,20 @@ static void stream_derive_caps(struct rig_stream_caps *dst,
     /* Rates (resampler built): native, then reachable curated standards,
      * then integer divisions of each native rate (factors 2..10, exact
      * results only) — in that priority order, deduplicated, ascending. This
-     * list is discoverability; acceptance at open is rule-based. Audio may
-     * go up to the largest native rate, I/Q only strictly below it
-     * (downward-only: the I/Q sample rate is the represented bandwidth).
+     * list is discoverability; acceptance at open is rule-based. RX stays
+     * bounded by native bandwidth; TX may downsample a higher app rate.
      * Without the resampler the effective rates equal the native rates. */
     {
         int native_max = stream_rate_list_max(src->sample_rates);
+        int is_rx = stream_type_is_rx(src->type);
         int n;
 
         for (int i = 0; stream_curated_rates[i] != 0; i++)
         {
             int r = stream_curated_rates[i];
-            int native_rate = stream_rate_source(src->sample_rates, r);
+            int native_rate = stream_rate_source(src->sample_rates, r, is_rx);
 
-            if (((is_iq && r < native_max) || (!is_iq && r <= native_max))
+            if ((!is_rx || (is_iq ? r < native_max : r <= native_max))
                     && native_rate > 0
                     && stream_conv_rate_supported(native_rate, r))
             {
@@ -839,15 +840,19 @@ static int caps_rate_native(const struct rig_stream_caps *caps, int rate)
 }
 
 #ifdef HAVE_SAMPLERATE
-/* Smallest native rate at or above the requested rate, or zero. */
-static int stream_rate_source(const int *native_rates, int requested_rate)
+/* Prefer the smallest native rate at or above the request. TX may instead
+ * use the largest native rate below it, preserving the most bandwidth. */
+static int stream_rate_source(const int *native_rates, int requested_rate,
+                              int is_rx)
 {
     int best = 0;
+    int largest = 0;
 
     for (int i = 0; i < HAMLIB_MAX_STREAM_RATES
             && native_rates[i] != 0; i++)
     {
         int rate = native_rates[i];
+        if (rate > largest) { largest = rate; }
 
         if (rate >= requested_rate && (best == 0 || rate < best))
         {
@@ -855,7 +860,7 @@ static int stream_rate_source(const int *native_rates, int requested_rate)
         }
     }
 
-    return best;
+    return best ? best : is_rx ? 0 : largest;
 }
 #endif
 
@@ -1066,14 +1071,14 @@ static int resolve_stream_source(const struct rig_stream_config *config,
         return RIG_OK;    /* conv stays RIG_STREAM_CONV_NONE */
     }
 
-    /* Rate: native, or any rate that a single resampler stage can convert
-     * against the smallest suitable native source. I/Q remains bounded by
-     * the native bandwidth just like audio is bounded by its largest rate. */
+    /* RX cannot acquire bandwidth above the native ceiling. TX can submit
+     * a higher-rate waveform for downsampling to the backend's rate. */
     if (!caps_rate_native(caps, config->sample_rate))
     {
 #ifdef HAVE_SAMPLERATE
         int src_rate = stream_rate_source(caps->sample_rates,
-                                          config->sample_rate);
+                                          config->sample_rate,
+                                          stream_type_is_rx(config->type));
 
         if (src_rate <= 0)
         {

@@ -746,13 +746,69 @@ void test_rate_ratio_limits(void)
     teardown_rig(rig);
 }
 
+void test_tx_rate_above_native(void)
+{
+    RIG *rig = setup_rig(&stub_caps_ratio_stream);
+    TEST_ASSERT(rig != NULL);
+    struct rig_stream_caps session[2];
+    memcpy(session, stub_ratio_stream_caps, sizeof(session));
+    session[0].sample_rates[0] = 12000;
+    session[1].sample_rates[0] = 12000;
+    TEST_ASSERT(stream_set_session_caps(rig, session, 2) == RIG_OK);
+
+    const struct rig_stream_caps *rx = rig_stream_caps_at(rig, 0);
+    const struct rig_stream_caps *tx = rig_stream_caps_at(rig, 1);
+    TEST_ASSERT(rx != NULL && tx != NULL);
+    TEST_CHECK(!rate_in_list(rx->sample_rates, 48000));
+    TEST_CHECK(tx->native_sample_rates[0] == 12000);
 #ifdef HAVE_SAMPLERATE
-void test_converted_tx_drain_and_cancel(void)
+    TEST_CHECK(rate_in_list(tx->sample_rates, 48000));
+#else
+    TEST_CHECK(!rate_in_list(tx->sample_rates, 48000));
+#endif
+
+    struct rig_stream_config *cfg = rig_stream_config_alloc();
+    TEST_ASSERT(cfg != NULL);
+    cfg->type = RIG_STREAM_TYPE_AUDIO_TX;
+    cfg->format = RIG_STREAM_FORMAT_PCM_F32;
+    cfg->channels = 1;
+    cfg->sample_rate = 48000;
+    rig_stream_t *stream = NULL;
+    int ret = rig_stream_open(rig, cfg, &stream);
+#ifdef HAVE_SAMPLERATE
+    TEST_CHECK(ret == RIG_OK);
+    if (ret == RIG_OK)
+    {
+        TEST_CHECK(stream->backend_config.sample_rate == 12000);
+        TEST_CHECK(rig_stream_get_conversions(stream) == RIG_STREAM_CONV_RATE);
+        rig_stream_close(rig, stream);
+    }
+#else
+    TEST_CHECK(ret == -RIG_EINVAL);
+#endif
+    cfg->require_native = RIG_STREAM_CONV_RATE;
+#ifdef HAVE_SAMPLERATE
+    TEST_CHECK(rig_stream_open(rig, cfg, &stream) == -RIG_ENAVAIL);
+#else
+    TEST_CHECK(rig_stream_open(rig, cfg, &stream) == -RIG_EINVAL);
+#endif
+    cfg->require_native = 0;
+    cfg->sample_rate = 12000 * 257;
+    TEST_CHECK(rig_stream_open(rig, cfg, &stream) == -RIG_EINVAL);
+    cfg->type = RIG_STREAM_TYPE_AUDIO_RX;
+    cfg->sample_rate = 48000;
+    TEST_CHECK(rig_stream_open(rig, cfg, &stream) == -RIG_EINVAL);
+    rig_stream_config_free(cfg);
+    teardown_rig(rig);
+}
+
+#ifdef HAVE_SAMPLERATE
+static void check_converted_tx_drain_and_cancel(int app_rate, int native_rate)
 {
     RIG *rig = setup_rig(&stub_caps_ratio_stream);
     TEST_ASSERT(rig != NULL);
     struct rig_stream_caps session = stub_ratio_stream_caps[1];
-    session.sample_rates[0] = 48000;
+    session.sample_rates[0] = native_rate;
     TEST_ASSERT(stream_set_session_caps(rig, &session, 1) == RIG_OK);
     TEST_ASSERT(rig_set_conf(rig, rig_token_lookup(rig,
             "stream_resample_quality"), "fast") == RIG_OK);
@@ -761,7 +817,7 @@ void test_converted_tx_drain_and_cancel(void)
     cfg->type = RIG_STREAM_TYPE_AUDIO_TX;
     cfg->format = RIG_STREAM_FORMAT_PCM_F32;
     cfg->channels = 1;
-    cfg->sample_rate = 12000;
+    cfg->sample_rate = app_rate;
     cfg->buffer_bytes = 64;
     rig_stream_t *stream = NULL;
     TEST_ASSERT(rig_stream_open(rig, cfg, &stream) == RIG_OK);
@@ -769,9 +825,11 @@ void test_converted_tx_drain_and_cancel(void)
 
     for (int i = 0; i < 4096; ++i) { input[i] = (float)(0.5 * sin(i * 0.03)); }
 
-    size_t expected_frames = 16384;
-    TEST_ASSERT(rig_stream_resample(input, 12000, expected, 48000,
+    size_t expected_frames = sizeof(expected) / sizeof(expected[0]);
+    TEST_ASSERT(rig_stream_resample(input, app_rate, expected, native_rate,
                                     4096, &expected_frames, 1, RIG_RESAMPLE_FAST) == 0);
+    TEST_ASSERT(expected_frames == (size_t)4096 * native_rate / app_rate);
+    size_t output_bytes = expected_frames * sizeof(float);
 
     for (int segment = 0; segment < 3; ++segment)
     {
@@ -789,9 +847,9 @@ void test_converted_tx_drain_and_cancel(void)
             TEST_ASSERT(written <= remaining);
             partial |= written < remaining;
             accepted += written;
-            TEST_ASSERT(received < sizeof(output));
+            TEST_ASSERT(received < output_bytes);
             received += stream_ringbuf_read(&stream->ringbuf,
-                                            (unsigned char *)output + received, sizeof(output) - received, 0);
+                                            (unsigned char *)output + received, output_bytes - received, 0);
         }
 
         TEST_CHECK(partial);
@@ -803,7 +861,7 @@ void test_converted_tx_drain_and_cancel(void)
             ret = rig_stream_drain(rig, stream, 0);
             TEST_ASSERT(ret == RIG_OK || ret == -RIG_ETIMEOUT);
             size_t pending = stream_ringbuf_available(&stream->ringbuf);
-            TEST_ASSERT(pending <= sizeof(output) - received);
+            TEST_ASSERT(pending <= output_bytes - received);
 
             if (pending)
             {
@@ -813,7 +871,7 @@ void test_converted_tx_drain_and_cancel(void)
         }
 
         TEST_CHECK(ret == RIG_OK);
-        TEST_CHECK(received == expected_frames * sizeof(float));
+        TEST_ASSERT(received == output_bytes);
 
         for (size_t i = 0; i < received / sizeof(float); ++i)
         {
@@ -838,6 +896,12 @@ void test_converted_tx_drain_and_cancel(void)
     rig_stream_close(rig, stream);
     rig_stream_config_free(cfg);
     teardown_rig(rig);
+}
+
+void test_converted_tx_drain_and_cancel(void)
+{
+    check_converted_tx_drain_and_cancel(48000, 12000);
+    check_converted_tx_drain_and_cancel(12000, 48000);
 }
 #endif
 
@@ -3634,6 +3698,7 @@ TEST_LIST =
     { "converted_target_follows_pending_output", test_converted_target_follows_pending_output },
     { "get_stream_caps_none",     test_get_stream_caps_none },
     { "stream_conf_tokens",       test_stream_conf_tokens },
+    { "tx_rate_above_native",     test_tx_rate_above_native },
 #ifdef HAVE_SAMPLERATE
     { "converted_tx_drain_and_cancel", test_converted_tx_drain_and_cancel },
 #endif

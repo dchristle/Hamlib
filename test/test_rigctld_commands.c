@@ -112,12 +112,14 @@ extern int is_rigctld;
 #define EXPECTED_AUDIO_RATES \
     "800,1000,1600,2000,2400,3000,3200,4000,4800,6000,8000,9600,11025," \
     "12000,16000,19200,22050,24000,32000,44100,48000,96000"
+#define EXPECTED_AUDIO_TX_RATES EXPECTED_AUDIO_RATES ",192000"
 #define EXPECTED_IQ_RATES \
     "2400,3000,4000,4800,6000,8000,9600,11025,12000,16000,19200,22050," \
     "24000,32000,38400,44100,48000,64000,96000,192000"
 #else
 /* Without the resampler the effective sets equal the native sets. */
 #define EXPECTED_AUDIO_RATES EXPECTED_AUDIO_NATIVE_RATES
+#define EXPECTED_AUDIO_TX_RATES EXPECTED_AUDIO_NATIVE_RATES
 #define EXPECTED_IQ_RATES    EXPECTED_IQ_NATIVE_RATES
 #endif
 
@@ -131,7 +133,7 @@ extern int is_rigctld;
     "native_rates=" EXPECTED_AUDIO_NATIVE_RATES " native_channels=1,2"
 #define EXPECTED_AUDIO_TX_LINE \
     "type=AUDIO_TX formats=PCM_S8,PCM_U8,PCM_S16,PCM_F32,OPUS " \
-    "rates=" EXPECTED_AUDIO_RATES " channels=1,2 max_streams=4 " \
+    "rates=" EXPECTED_AUDIO_TX_RATES " channels=1,2 max_streams=4 " \
     "flags=TIMED_TX_COARSE,TIMED_TX_SAMPLE,BURST_PTT tx_horizon_ms=30000 " \
     "native_formats=PCM_F32,OPUS " \
     "native_rates=" EXPECTED_AUDIO_NATIVE_RATES " native_channels=1,2"
