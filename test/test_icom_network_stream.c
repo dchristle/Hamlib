@@ -34,6 +34,7 @@
 #include "acutest.h"
 #include "icom_network_mock.h"
 
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +46,8 @@
 #include "icom_defs.h"
 #include "stream.h"
 #include "cache.h"
+#include "network_session.h"
+#include "network_utils.h"
 
 /* Open the IC-7610 network model against the mock radio on loopback. Returns
  * NULL if the open failed, having cleaned up. */
@@ -1607,8 +1610,186 @@ void test_tx_drain_includes_partial_frame(void)
     mock_stop(&mock);
 }
 
+
+#ifdef __MINGW32__
+#define TEST_TRANSIENT_SOCKET_ERROR WSAEWOULDBLOCK
+#else
+#define TEST_TRANSIENT_SOCKET_ERROR EAGAIN
+#endif
+
+static void wait_tx_bytes(struct mock_server *mock, int expected)
+{
+    for (int i = 0; i < 200 && mock->audio_tx_bytes < expected; ++i)
+    {
+        usleep(1000);
+    }
+    TEST_ASSERT_(mock->audio_tx_bytes == expected, "received %d bytes, expected %d",
+                 mock->audio_tx_bytes, expected);
+}
+
+static void reset_tx_capture(struct mock_server *mock)
+{
+    memset(mock->audio_tx_prefix, 0, sizeof(mock->audio_tx_prefix));
+    mock->audio_tx_bytes = 0;
+}
+
+static void check_rx_after_tx_close(RIG *rig, rig_stream_t *rx,
+                                    struct mock_server *mock)
+{
+    const uint16_t sequence[] = { 1 };
+    uint8_t expected[16];
+    for (size_t i = 0; i < sizeof(expected); i += 2)
+    {
+        expected[i] = 1;
+        expected[i + 1] = 0;
+    }
+    script_audio(mock, sequence, 1);
+    check_fresh_read(rig, rx, expected);
+    struct rig_stream_stats stats;
+    TEST_CHECK(rig_stream_get_stats(rig, rx, &stats) == RIG_OK);
+    TEST_CHECK(stats.fail_reason == RIG_COMM_REASON_NONE);
+}
+
+static void tx_packet_loss_case(int fragment, int partial)
+{
+    struct mock_server mock;
+    mock_start(&mock);
+    RIG *rig = open_against_mock(&mock, NULL);
+    TEST_ASSERT(rig != NULL);
+    struct icom_priv_data *priv = STATE(rig)->priv;
+    struct icom_network_session *session = priv->netsession;
+    rig_stream_t *rx = NULL, *tx = NULL;
+    TEST_ASSERT(stream_open(rig, RIG_STREAM_TYPE_AUDIO_RX,
+                            RIG_STREAM_FORMAT_PCM_S16, 48000, 1, &rx) == RIG_OK);
+    check_fresh_read(rig, rx, mock_audio);
+    TEST_ASSERT(stream_open(rig, RIG_STREAM_TYPE_AUDIO_TX,
+                            RIG_STREAM_FORMAT_PCM_S16, 48000, 1, &tx) == RIG_OK);
+
+    int16_t frame[960];
+    for (int i = 0; i < 960; ++i) { frame[i] = (int16_t)(200 + i); }
+    size_t input_bytes = partial ? sizeof(frame[0]) : sizeof(frame);
+    uint8_t expected_wire[1920] = { 0 };
+    memcpy(expected_wire, frame, input_bytes);
+    size_t lost_offset = fragment == 0 ? 0 : 1364;
+    size_t lost_bytes = fragment == 0 ? 1364 : 556;
+    size_t surviving_offset = fragment == 0 ? 1364 : 0;
+    uint32_t lost_samples = partial ? (fragment == 0 ? 1 : 0)
+                                    : (uint32_t)(lost_bytes / 2);
+    uint64_t loss_index = partial ? (uint64_t)fragment : lost_offset / 2;
+    icom_network_session_test_fail_audio_packet(session,
+                                               TEST_TRANSIENT_SOCKET_ERROR,
+                                               fragment);
+    size_t written = 0;
+    TEST_ASSERT(rig_stream_write(rig, tx, frame, input_bytes, &written,
+                                100, NULL) == RIG_OK);
+    TEST_CHECK(written == input_bytes);
+    TEST_CHECK(rig_stream_drain(rig, tx, 1000) == RIG_OK);
+    wait_tx_bytes(&mock, (int)(sizeof(expected_wire) - lost_bytes));
+    TEST_CHECK(mock.audio_tx_sequence == (fragment == 0 ? 2 : 1));
+    TEST_CHECK(memcmp(mock.audio_tx_prefix, expected_wire + surviving_offset,
+                      sizeof(mock.audio_tx_prefix)) == 0);
+
+    struct rig_stream_stats stats;
+    TEST_CHECK(rig_stream_get_stats(rig, tx, &stats) == RIG_OK);
+    TEST_CHECK(stats.fail_reason == RIG_COMM_REASON_NONE);
+    TEST_CHECK(stats.overruns == 1);
+    TEST_CHECK(stats.dropped_samples_overrun == lost_samples);
+    struct rig_stream_write_status event = { 0 };
+    TEST_CHECK(rig_stream_wait_write_status(rig, tx, &event, 0) == RIG_OK);
+    TEST_CHECK(event.event == RIG_STREAM_WRITE_EVENT_OVERRUN);
+    TEST_CHECK(event.dropped_samples == lost_samples);
+    TEST_CHECK(event.sample_index == loss_index);
+    TEST_CHECK(rig_stream_wait_write_status(rig, tx, &event, 0) == -RIG_ETIMEOUT);
+
+    reset_tx_capture(&mock);
+    for (int i = 0; i < 960; ++i) { frame[i] = (int16_t)(3000 + i); }
+    TEST_ASSERT(rig_stream_write(rig, tx, frame, sizeof(frame), &written,
+                                100, NULL) == RIG_OK);
+    TEST_CHECK(written == sizeof(frame));
+    TEST_CHECK(rig_stream_drain(rig, tx, 1000) == RIG_OK);
+    wait_tx_bytes(&mock, sizeof(frame));
+    TEST_CHECK(mock.audio_tx_sequence == 4);
+    TEST_CHECK(memcmp(mock.audio_tx_prefix, frame,
+                      sizeof(mock.audio_tx_prefix)) == 0);
+
+    reset_tx_capture(&mock);
+    mock_request_audio_replay(&mock, (uint16_t)(fragment + 1));
+    wait_tx_bytes(&mock, (int)lost_bytes);
+    TEST_CHECK(mock.audio_tx_sequence == fragment + 1);
+    TEST_CHECK(memcmp(mock.audio_tx_prefix, expected_wire + lost_offset,
+                      sizeof(mock.audio_tx_prefix)) == 0);
+    TEST_CHECK(rig_stream_get_stats(rig, tx, &stats) == RIG_OK);
+    TEST_CHECK(stats.overruns == 1);
+    TEST_CHECK(stats.dropped_samples_overrun == lost_samples);
+
+    TEST_CHECK(rig_stream_close(rig, tx) == RIG_OK);
+    check_rx_after_tx_close(rig, rx, &mock);
+    TEST_CHECK(rig_stream_close(rig, rx) == RIG_OK);
+    rig_close(rig);
+    rig_cleanup(rig);
+    mock_stop(&mock);
+}
+
+void test_tx_first_packet_loss_preserves_stream(void)
+{ tx_packet_loss_case(0, 0); }
+void test_tx_second_packet_loss_preserves_stream(void)
+{ tx_packet_loss_case(1, 0); }
+void test_tx_partial_frame_loss_excludes_padding(void)
+{ tx_packet_loss_case(0, 1); }
+void test_tx_padding_packet_loss_has_no_lost_samples(void)
+{ tx_packet_loss_case(1, 1); }
+
+void test_tx_sustained_send_loss_fails_only_tx(void)
+{
+    struct mock_server mock;
+    mock_start(&mock);
+    RIG *rig = open_against_mock(&mock, "net_liveness_timeout=1000");
+    TEST_ASSERT(rig != NULL);
+    struct icom_priv_data *priv = STATE(rig)->priv;
+    struct icom_network_session *session = priv->netsession;
+    rig_stream_t *rx = NULL, *tx = NULL;
+    TEST_ASSERT(stream_open(rig, RIG_STREAM_TYPE_AUDIO_RX,
+                            RIG_STREAM_FORMAT_PCM_S16, 48000, 1, &rx) == RIG_OK);
+    check_fresh_read(rig, rx, mock_audio);
+    TEST_ASSERT(stream_open(rig, RIG_STREAM_TYPE_AUDIO_TX,
+                            RIG_STREAM_FORMAT_PCM_S16, 48000, 1, &tx) == RIG_OK);
+    icom_network_session_test_fail_audio_sends(session,
+                                              TEST_TRANSIENT_SOCKET_ERROR,
+                                              100000);
+    int16_t frame[960] = { 1000 };
+    int result = RIG_OK;
+    int64_t started = icom_network_now_ms();
+    while (result != -RIG_EIO && icom_network_now_ms() - started < 3000)
+    {
+        size_t written = 0;
+        result = rig_stream_write(rig, tx, frame, sizeof(frame), &written,
+                                   100, NULL);
+        TEST_CHECK(result == RIG_OK || result == -RIG_ETIMEOUT || result == -RIG_EIO);
+    }
+    TEST_CHECK(result == -RIG_EIO);
+    TEST_CHECK(icom_network_now_ms() - started >= 1000);
+    TEST_CHECK(rig_stream_drain(rig, tx, 100) == -RIG_EIO);
+    struct rig_stream_stats stats;
+    TEST_CHECK(rig_stream_get_stats(rig, tx, &stats) == RIG_OK);
+    TEST_CHECK(stats.fail_reason == RIG_COMM_REASON_SOCKET_ERROR);
+    TEST_CHECK(stats.overruns > 1);
+    TEST_CHECK(icom_network_session_is_valid(session));
+    TEST_CHECK(mock.audio_tx_bytes == 0);
+    TEST_CHECK(rig_stream_close(rig, tx) == RIG_OK);
+    check_rx_after_tx_close(rig, rx, &mock);
+    TEST_CHECK(rig_stream_close(rig, rx) == RIG_OK);
+    rig_close(rig);
+    rig_cleanup(rig);
+    mock_stop(&mock);
+}
+
 TEST_LIST =
 {
+    { "tx_first_packet_loss_preserves_stream", test_tx_first_packet_loss_preserves_stream },
+    { "tx_second_packet_loss_preserves_stream", test_tx_second_packet_loss_preserves_stream },
+    { "tx_partial_frame_loss_excludes_padding", test_tx_partial_frame_loss_excludes_padding },
+    { "tx_padding_packet_loss_has_no_lost_samples", test_tx_padding_packet_loss_has_no_lost_samples },
+    { "tx_sustained_send_loss_fails_only_tx", test_tx_sustained_send_loss_fails_only_tx },
     { "tx_reopen_discards_replay_history", test_tx_reopen_discards_replay_history },
     { "tx_failure_discards_partial_frame", test_tx_failure_discards_partial_frame },
     { "tx_close_discards_partial_frame", test_tx_close_discards_partial_frame },

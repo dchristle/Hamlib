@@ -196,7 +196,7 @@ const struct confparams icom_network_config_params[] =
     },
     {
         TOK_NET_LIVENESS_TIMEOUT, "net_liveness_timeout", "Liveness timeout (ms)",
-        "Silence from the radio before the session is declared lost "
+        "Radio silence or continuous TX local send failures before failure "
         "(0 = never, losses surface as command timeouts; minimum 1000)",
         ICOM_NETWORK_STR(ICOM_NETWORK_DEFAULT_LIVENESS_MS),
         RIG_CONF_NUMERIC, { .n = { 0, 60000, 100 } }

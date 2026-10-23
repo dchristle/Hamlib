@@ -2253,8 +2253,9 @@ struct rig_stream_write_info {
 struct rig_stream_stats {
     /* event counts (local) */
     uint32_t overruns;          /* local data loss: ring overwrite, discarded
-                                   TX datagram suffix, or backend receive
-                                   queue overflow */
+                                   TX datagram/suffix, or backend receive
+                                   queue overflow; a locally dropped Icom TX
+                                   packet may later be retransmitted */
     uint32_t underruns;         /* local blocking read timed out empty */
     uint32_t gaps;              /* radio/network-side gaps marked by backend */
     uint32_t gaps_unknown;      /* subset of gaps with unknown size */
@@ -2293,7 +2294,7 @@ enum rig_stream_write_event {
     RIG_STREAM_WRITE_EVENT_NONE     = 0,
     RIG_STREAM_WRITE_EVENT_LATE     = 1,  /* timed-TX burst missed its slot */
     RIG_STREAM_WRITE_EVENT_UNDERRUN = 2,  /* TX ring emptied (writer too slow) */
-    RIG_STREAM_WRITE_EVENT_OVERRUN  = 3   /* TX ring full (writer too fast) */
+    RIG_STREAM_WRITE_EVENT_OVERRUN  = 3   /* TX queue or datagram loss */
 };
 
 /* rig_stream_write_status.flags bits */

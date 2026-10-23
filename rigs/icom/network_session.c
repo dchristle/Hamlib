@@ -147,6 +147,8 @@ struct icom_network_session_socket
     HAMLIB_ATOMIC int64_t error_since_ms;
     HAMLIB_ATOMIC int test_send_error;
     HAMLIB_ATOMIC int test_send_failures;
+    HAMLIB_ATOMIC int test_send_skip_packets;
+    HAMLIB_ATOMIC int test_send_one_packet;
     uint32_t local_id;          /* our id, derived from the bound local address */
     uint32_t remote_id;         /* server's id, learned from first reply */
     uint16_t send_sequence;          /* next TRACKED data-packet sequence (the radio
@@ -445,7 +447,7 @@ static void icom_network_session_note_error(
 
 /* Put one packet on the wire. Returns RIG_OK when all of it went out; a
  * failure is noted against the socket's health. */
-static int icom_network_session_send_raw(
+static int icom_network_session_send_raw_result(
     struct icom_network_session_socket *sock, const uint8_t *packet,
     size_t length)
 {
@@ -459,6 +461,15 @@ static int icom_network_session_send_raw(
     int err = 0;
     int64_t deadline = icom_network_now_ms() + 10;
     int retry = 0;
+    int inject = icom_network_packet_classify(packet, length, sock->role)
+                 == ICOM_NETWORK_PACKET_KIND_AUDIO;
+    if (inject && sock->test_send_skip_packets > 0)
+    {
+        sock->test_send_skip_packets--;
+        inject = 0;
+    }
+    int one_packet = inject && sock->test_send_one_packet;
+    if (one_packet) { sock->test_send_one_packet = 0; }
 
     /* Retry the same datagram, including its sequence, without holding up
      * stream abort indefinitely when a local UDP queue stays full. */
@@ -466,11 +477,9 @@ static int icom_network_session_send_raw(
     {
         ssize_t w;
         if (retry && icom_network_now_ms() >= deadline) { break; }
-        if (sock->test_send_failures > 0
-                && icom_network_packet_classify(packet, length, sock->role)
-                   == ICOM_NETWORK_PACKET_KIND_AUDIO)
+        if (inject && (one_packet || sock->test_send_failures > 0))
         {
-            sock->test_send_failures--;
+            if (!one_packet) { sock->test_send_failures--; }
             w = -1;
             err = sock->test_send_error;
         }
@@ -490,7 +499,15 @@ static int icom_network_session_send_raw(
               __func__, icom_network_session_role_name(sock->role), err,
               retry ? "; 10 ms retry budget exhausted" : "");
     icom_network_session_note_error(sock, "send", err);
-    return -RIG_EIO;
+    return retry ? -RIG_ETIMEOUT : -RIG_EIO;
+}
+
+static int icom_network_session_send_raw(
+    struct icom_network_session_socket *sock, const uint8_t *packet,
+    size_t length)
+{
+    return icom_network_session_send_raw_result(sock, packet, length) == RIG_OK
+           ? RIG_OK : -RIG_EIO;
 }
 
 /* Whether the socket has failed since the last packet it received. On a
@@ -1765,7 +1782,18 @@ int icom_network_session_test_fail_audio_sends(struct icom_network_session *s,
     int previous = s->audio.test_send_failures;
     s->audio.test_send_error = err;
     s->audio.test_send_failures = count;
+    s->audio.test_send_skip_packets = 0;
+    s->audio.test_send_one_packet = 0;
     return previous;
+}
+
+void icom_network_session_test_fail_audio_packet(struct icom_network_session *s,
+        int err, int skip_packets)
+{
+    s->audio.test_send_error = err;
+    s->audio.test_send_failures = 0;
+    s->audio.test_send_skip_packets = skip_packets;
+    s->audio.test_send_one_packet = 1;
 }
 
 void icom_network_session_test_fail_socket(struct icom_network_session *s,
@@ -2940,16 +2968,9 @@ int icom_network_audio_send(struct icom_network_session *s,
                       __func__, (unsigned)sequence);
         }
 
-        if (icom_network_session_send_raw(&s->audio, packet,
-                                          (size_t)packet_length) == RIG_OK)
-        {
-            if (icom_network_session_socket_failing(&s->audio))
-            {
-                rig_debug(RIG_DEBUG_WARN, "%s: audio socket has an outstanding hard error\n",
-                          __func__);
-            }
-            else { ret = (int)length; }
-        }
+        ret = icom_network_session_send_raw_result(&s->audio, packet,
+                                                   (size_t)packet_length);
+        if (ret == RIG_OK) { ret = (int)length; }
     }
 
     pthread_mutex_unlock(&s->audio.lock);

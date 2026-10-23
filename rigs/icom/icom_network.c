@@ -264,8 +264,9 @@ struct icom_network_stream_state
     struct rig_audio_codec_state *codec;
     pthread_t thread;
     HAMLIB_ATOMIC int running;  /* thread stop flag; read by the stream thread */
-    HAMLIB_ATOMIC uint64_t tx_completed_bytes;
+    HAMLIB_ATOMIC uint64_t tx_retired_bytes;
     unsigned tx_send_errors;  /* failed wire sends; first one is logged */
+    int64_t tx_drop_since_ms;
     int thread_started;
     enum icom_network_audio_user audio_user;
     unsigned generation;     /* the session connection this stream runs on */
@@ -655,9 +656,10 @@ static size_t icom_network_tx_encode(struct icom_network_stream_state *st,
 /* Send one wire frame as max-payload packets (a 1920-byte LPCM16 frame travels
  * as 1364 + 556). */
 static int icom_network_tx_send_fragments(struct icom_network_stream_state *st,
-        const uint8_t *wire, size_t length)
+        const uint8_t *wire, size_t length, size_t input_bytes)
 {
     size_t off = 0;
+    int result = RIG_OK;
 
     while (off < length)
     {
@@ -690,13 +692,34 @@ static int icom_network_tx_send_fragments(struct icom_network_stream_state *st,
             }
 
             st->tx_send_errors++;
-            stream_mark_failed(st->stream, RIG_COMM_REASON_SOCKET_ERROR);
-            return -RIG_EIO;
+            if (sent != -RIG_ETIMEOUT)
+            {
+                stream_mark_failed(st->stream, RIG_COMM_REASON_SOCKET_ERROR);
+                return -RIG_EIO;
+            }
+
+            struct rig_stream_write_status event = { 0 };
+            event.event = RIG_STREAM_WRITE_EVENT_OVERRUN;
+            event.sample_index = st->tx_retired_bytes / st->native_frame_bytes;
+            if (st->passthrough)
+            {
+                size_t begin = off < input_bytes ? off : input_bytes;
+                size_t end = off + chunk < input_bytes ? off + chunk : input_bytes;
+                event.sample_index += begin / st->native_frame_bytes;
+                event.dropped_samples = (uint32_t)((end - begin)
+                                                   / st->native_frame_bytes);
+            }
+            pthread_mutex_lock(&st->stream->ringbuf.lock);
+            st->stream->ringbuf.overrun_count++;
+            st->stream->dropped_samples_overrun += event.dropped_samples;
+            pthread_mutex_unlock(&st->stream->ringbuf.lock);
+            stream_record_write_status(st->stream, &event, 0);
+            result = -RIG_ETIMEOUT;
         }
 
         off += chunk;
     }
-    return RIG_OK;
+    return result;
 }
 
 /* TX thread: pull one frame from the ring, encode it, and put it on the wire.
@@ -729,9 +752,25 @@ static void *icom_network_tx_thread(void *arg)
 
         if (enc_bytes > 0)
         {
-            if (icom_network_tx_send_fragments(st, wire, enc_bytes) != RIG_OK)
-            { break; }
-            st->tx_completed_bytes += got;
+            int sent = icom_network_tx_send_fragments(st, wire, enc_bytes, got);
+            if (sent != RIG_OK && sent != -RIG_ETIMEOUT) { break; }
+            if (sent == RIG_OK) { st->tx_drop_since_ms = 0; }
+            else
+            {
+                int64_t now = icom_network_now_ms();
+                int timeout_ms = icom_network_session_config(st->sess)
+                                 ->liveness_timeout_ms;
+                if (!st->tx_drop_since_ms) { st->tx_drop_since_ms = now; }
+                if (timeout_ms > 0 && now - st->tx_drop_since_ms >= timeout_ms)
+                {
+                    rig_debug(RIG_DEBUG_WARN,
+                              "%s: TX local send failures exceeded %d ms\n",
+                              __func__, timeout_ms);
+                    stream_mark_failed(st->stream, RIG_COMM_REASON_SOCKET_ERROR);
+                    break;
+                }
+            }
+            st->tx_retired_bytes += got;
         }
         else
         {
@@ -987,8 +1026,8 @@ static int icom_network_stream_open(RIG *rig, struct rig_stream *stream)
     return RIG_OK;
 }
 
-/* Completion means all accepted PCM reached the UDP sender, not that the
- * radio acknowledged playout. The caller must allow the radio buffer tail. */
+/* Retired input was sent or reported as locally dropped; retransmission and
+ * radio playout may still be pending. The caller must allow the radio tail. */
 static int icom_network_stream_drain(RIG *rig, struct rig_stream *stream,
                                       int timeout_ms)
 {
@@ -1008,7 +1047,7 @@ static int icom_network_stream_drain(RIG *rig, struct rig_stream *stream,
         pthread_mutex_unlock(&stream->ringbuf.lock);
         if (closing || !st->running) { return -RIG_ENAVAIL; }
         if (failed || icom_network_stream_ended(st)) { return -RIG_EIO; }
-        if (st->tx_completed_bytes >= target) { return RIG_OK; }
+        if (st->tx_retired_bytes >= target) { return RIG_OK; }
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000

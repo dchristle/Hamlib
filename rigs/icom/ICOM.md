@@ -80,7 +80,7 @@ their ranges at runtime.
 | `net_tx_latency` | TX jitter buffer | 10–1000 ms | 150 |
 | `net_tx_enable` | Reserve a TX audio path | 0 / 1 | 1 |
 | `net_tx_frame_ms` | TX wire frame length | 5–100 ms | 20 |
-| `net_liveness_timeout` | Silence before the session is declared lost | 0 = never, else ≥ 1000 ms | 5000 |
+| `net_liveness_timeout` | Radio silence or continuous local TX send failure limit | 0 = never, else ≥ 1000 ms | 5000 |
 | `net_auto_reconnect` | Re-establish a lost session in the background | 0 / 1 | 0 |
 
 > **The codec and rate tokens take an index, not a value.** `net_sample_rate=4`
@@ -503,9 +503,10 @@ not end the session by themselves: a path that fails for a moment is ridden out
 for as long as `net_liveness_timeout` allows, and `0` still means never. They
 name the cause instead: a socket that went silent after reporting an error is
 lost as `SOCKET_ERROR` rather than `LINK_TIMEOUT`. While a socket reports
-errors, a CI-V command or TX audio packet sent on it fails at once with
-`-RIG_EIO`; the next packet received clears that, which on a working CI-V
-socket is a few tens of milliseconds away.
+errors, a CI-V command sent on it fails at once with `-RIG_EIO`; the next
+packet received clears that, which on a working CI-V socket is a few tens
+of milliseconds away. Audio submissions use their current send result;
+an earlier receive error alone does not discard a successful audio send.
 
 An unsolicited disconnect from the radio ends the session immediately. Either
 way:
@@ -556,6 +557,30 @@ reporting errors at that moment, and it clears as soon as anything arrives.)
 The threshold must be either 0 (never give up) or at least 1000 ms. The radio's
 regular traffic is its answer to a 500 ms keepalive, so a threshold near that
 interval would trip on ordinary jitter.
+
+### Local TX send failures
+
+Audio datagrams retain their sequence and replay copy when transient local
+send retries expire after 10 ms. The sender reports a local overrun and
+continues with subsequent fragments and frames; it does not requeue expired
+audio ahead of fresh input. A successful send is not rejected solely because
+an earlier receive error remains recorded against the audio socket.
+
+Overruns and write-status events count initial local drops, not confirmed RF
+loss: the radio may recover a packet by requesting retransmission. For linear
+PCM, positions and dropped-sample counts use the backend-native sample rate
+and exclude final padding, including when application input was resampled.
+For encoded audio, the event has an unknown sample count (zero).
+Drain waits until accepted input is sent or reported dropped. It does not
+acknowledge radio playout or completion of retransmission.
+
+Continuous frames with local send loss fail the TX stream after
+`net_liveness_timeout` milliseconds, even if RX/control remains healthy.
+A complete successfully sent frame resets that timer; zero disables it.
+This uses the same configurable outage budget as session liveness, without
+changing the session's receive-silence checks or stopping a surviving RX
+stream. Invalid/closed transports, replaced sessions and encoding failures
+remain terminal. The caller must still pace input and allow the radio tail.
 
 ### Automatic reconnection
 

@@ -677,12 +677,29 @@ static void audio_send_retry_case(int scenario)
         }
         TEST_CHECK(memcmp(mock.audio_tx_prefix, pcm, sizeof(pcm)) == 0);
     }
+    else if (scenario == 3)
+    {
+        for (int packet = 0; packet < 2; ++packet)
+        {
+            icom_network_session_test_fail_socket(s, ICOM_NETWORK_ROLE_AUDIO,
+                                                  TEST_HARD_SOCKET_ERROR);
+            TEST_CHECK(icom_network_audio_send(s, generation, pcm + packet * 16,
+                                               16) == 16);
+        }
+        for (int i = 0; i < 100 && mock.audio_tx_bytes < (int)sizeof(pcm); ++i)
+            { hl_usleep(1000); }
+        TEST_CHECK(mock.audio_tx_bytes == sizeof(pcm));
+        TEST_CHECK(mock.audio_tx_sequence == 2);
+        TEST_CHECK(memcmp(mock.audio_tx_prefix, pcm, sizeof(pcm)) == 0);
+        TEST_CHECK(icom_network_session_is_valid(s));
+    }
     else
     {
         int err = scenario == 1 ? TEST_TRANSIENT_SOCKET_ERROR : TEST_HARD_SOCKET_ERROR;
         icom_network_session_test_fail_audio_sends(s, err, 1000);
         int64_t started = icom_network_now_ms();
-        TEST_CHECK(icom_network_audio_send(s, generation, pcm, 16) == -RIG_EIO);
+        int expected = scenario == 1 ? -RIG_ETIMEOUT : -RIG_EIO;
+        TEST_CHECK(icom_network_audio_send(s, generation, pcm, 16) == expected);
         int64_t elapsed = icom_network_now_ms() - started;
         int remaining = icom_network_session_test_fail_audio_sends(s, 0, 0);
         /* Scheduling can delay return, but no new attempt follows the deadline. */
@@ -707,6 +724,8 @@ void test_session_audio_send_retry_deadline(void)
 { audio_send_retry_case(1); }
 void test_session_audio_send_hard_error_is_immediate(void)
 { audio_send_retry_case(2); }
+void test_session_audio_send_ignores_historical_socket_error(void)
+{ audio_send_retry_case(3); }
 
 /* Wait up to ms for the session to be declared lost; returns the time taken,
  * or -1 if it stayed valid. */
@@ -2221,6 +2240,7 @@ TEST_LIST =
     { "audio_send_retries_preserve_datagrams", test_session_audio_send_retries_preserve_datagrams },
     { "audio_send_retry_deadline", test_session_audio_send_retry_deadline },
     { "audio_send_hard_error_is_immediate", test_session_audio_send_hard_error_is_immediate },
+    { "audio_send_ignores_historical_socket_error", test_session_audio_send_ignores_historical_socket_error },
 #ifndef __MINGW32__
     { "broken_udp_no_sigpipe", test_session_broken_udp_no_sigpipe },
 #endif

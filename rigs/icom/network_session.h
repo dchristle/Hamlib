@@ -48,8 +48,8 @@ struct icom_network_session_config
     char     client_name[17];  /* client name reported to the radio */
     char     radio_name[33];   /* this model's own name; the fallback selector
                                   and the cross-check for a mismatch warning */
-    /* Milliseconds of silence from the radio before the session is treated as
-     * lost. 0 disables the check, leaving loss to surface as command timeouts. */
+    /* Radio-silence budget for session loss, also used by TX for consecutive
+     * frames with local send loss. 0 disables both checks. */
     int      liveness_timeout_ms;
     int      auto_reconnect;   /* re-establish a lost session in the background */
     int      radio_index;      /* index into the advertised radio list,
@@ -142,8 +142,8 @@ void icom_network_session_audio_stats(const struct icom_network_session *s,
 
 /* Test seam: report err (an errno, or a WSA error on Windows) against one of
  * the session's sockets, exactly as a failing send or receive would, filter
- * included. A momentary error changes nothing; a hard one makes sends on that
- * socket fail at once, and silence after it is reported as SOCKET_ERROR rather
+ * included. A momentary error changes nothing; a hard one makes CI-V sends
+ * fail at once, and silence after it is reported as SOCKET_ERROR rather
  * than LINK_TIMEOUT. Needed because not every system produces a real one --
  * Windows does not report a refused local port -- so this is the only way to
  * exercise those paths everywhere. Nothing in the library calls it. */
@@ -158,6 +158,11 @@ int icom_network_session_audio_wait_ms(const struct stream_reorder *r,
  * previous remaining count. Configure only while the test producer is idle. */
 int icom_network_session_test_fail_audio_sends(struct icom_network_session *s,
         int err, int count);
+
+/* Fail every attempt of one audio datagram after skipping skip_packets.
+ * Configure only while the test producer is idle. */
+void icom_network_session_test_fail_audio_packet(struct icom_network_session *s,
+        int err, int skip_packets);
 
 void icom_network_session_test_fail_socket(struct icom_network_session *s,
         enum icom_network_socket_role role, int err);
@@ -246,6 +251,9 @@ int icom_network_audio_recv(struct icom_network_session *s,
                             unsigned generation, unsigned char *buf,
                             size_t buffer_length, int timeout_ms,
                             struct icom_network_audio_loss *loss);
+/* Returns payload bytes on submission, -RIG_ETIMEOUT for a datagram whose
+ * transient local retries expired, or another error for terminal failure.
+ * A timed-out datagram retains its sequence and may still be retransmitted. */
 int icom_network_audio_send(struct icom_network_session *s,
                             unsigned generation, const unsigned char *buf,
                             size_t length);
