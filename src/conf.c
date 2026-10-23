@@ -1708,7 +1708,7 @@ int HAMLIB_API rig_set_conf(RIG *rig, hamlib_token_t token, const char *val)
             return -RIG_EINVAL;
         }
 
-        rig_debug(RIG_DEBUG_VERBOSE, "%s: %s='%s'\n", __func__, cfp->name, val);
+        rig_debug(RIG_DEBUG_VERBOSE, "%s: %s\n", __func__, cfp->name);
     }
 
     if (IS_TOKEN_FRONTEND(token))

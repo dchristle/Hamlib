@@ -6,6 +6,7 @@
 
 #include "acutest.h"
 #include "test_debug.h"
+#include <stdio.h>
 #include <string.h>
 
 static void check_ptt_config(RIG *rig, const char *expected)
@@ -93,9 +94,98 @@ static void test_ptt_none_then_cat(void)
     TEST_CHECK(rig_cleanup(configured) == RIG_OK);
 }
 
+struct config_log_capture
+{
+    char text[4096];
+    int truncated;
+};
+
+static const char *config_backend_value;
+static hamlib_token_t config_backend_token;
+static int config_backend_result;
+static int config_backend_calls;
+
+static int capture_config_log(enum rig_debug_level_e level, rig_ptr_t arg,
+                              const char *format, va_list args)
+{
+    struct config_log_capture *capture = arg;
+    size_t used = strlen(capture->text);
+    int length;
+
+    (void)level;
+    length = vsnprintf(capture->text + used, sizeof(capture->text) - used,
+                       format, args);
+
+    if (length < 0 || (size_t)length >= sizeof(capture->text) - used)
+    {
+        capture->truncated = 1;
+    }
+
+    return length;
+}
+
+static int record_config_value(RIG *rig, hamlib_token_t token, const char *value)
+{
+    (void)rig;
+    config_backend_value = value;
+    config_backend_token = token;
+    ++config_backend_calls;
+    return config_backend_result;
+}
+
+static void test_configuration_values_stay_out_of_debug_logs(void)
+{
+    const struct confparams params[] =
+    {
+        { .token = 1, .name = "net_password", .type = RIG_CONF_STRING },
+        { .token = 2, .name = "access_key", .type = RIG_CONF_STRING },
+        { .token = RIG_CONF_END }
+    };
+    const struct rig_caps caps =
+    {
+        .cfgparams = params,
+        .set_conf = record_config_value
+    };
+    RIG rig = { .caps = &caps };
+    const char *values[] = { "synthetic-accepted-secret", "synthetic-rejected-secret" };
+    const int results[] = { RIG_OK, -RIG_EINVAL };
+    enum rig_debug_level_e previous_level;
+
+    rig_get_debug(&previous_level);
+    rig_set_debug(RIG_DEBUG_TRACE);
+
+    for (size_t parameter = 0; parameter < 2; ++parameter)
+    {
+        for (size_t result = 0; result < 2; ++result)
+        {
+            struct config_log_capture capture = { { 0 }, 0 };
+            config_backend_value = NULL;
+            config_backend_token = RIG_CONF_END;
+            config_backend_calls = 0;
+            config_backend_result = results[result];
+            rig_set_debug_callback(capture_config_log, &capture);
+
+            int actual = rig_set_conf(&rig, params[parameter].token, values[result]);
+
+            rig_set_debug_callback(NULL, NULL);
+            TEST_CASE(params[parameter].name);
+            TEST_CHECK(actual == results[result]);
+            TEST_CHECK(config_backend_calls == 1);
+            TEST_CHECK(config_backend_token == params[parameter].token);
+            TEST_CHECK(config_backend_value == values[result]);
+            TEST_CHECK(!capture.truncated);
+            TEST_CHECK(strstr(capture.text, params[parameter].name) != NULL);
+            TEST_CHECK(strstr(capture.text, values[result]) == NULL);
+        }
+    }
+
+    rig_set_debug(previous_level);
+}
+
 TEST_LIST =
 {
     { "ptt_overrides_are_instance_local", test_ptt_overrides_are_instance_local },
     { "ptt_none_then_cat", test_ptt_none_then_cat },
+    { "configuration_values_stay_out_of_debug_logs", test_configuration_values_stay_out_of_debug_logs },
     { NULL, NULL }
 };

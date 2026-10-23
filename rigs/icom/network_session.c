@@ -2019,13 +2019,13 @@ static int icom_network_session_stage_login(struct icom_network_session *s)
 
     if (parsed != RIG_OK || lr.error != 0)
     {
-        rig_debug(RIG_DEBUG_ERR, "%s: login rejected, error=0x%08x token=0x%08x\n",
-                  __func__, (unsigned)lr.error, (unsigned)lr.token);
+        rig_debug(RIG_DEBUG_ERR, "%s: login rejected, error=0x%08x\n",
+                  __func__, (unsigned)lr.error);
         return -RIG_ESECURITY;
     }
 
-    rig_debug(RIG_DEBUG_VERBOSE, "%s: login OK, token=0x%08x conn='%s'\n",
-              __func__, (unsigned)lr.token, lr.connection);
+    rig_debug(RIG_DEBUG_VERBOSE, "%s: login OK, conn='%s'\n",
+              __func__, lr.connection);
 
     s->token = lr.token;
 
