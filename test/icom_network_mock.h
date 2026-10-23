@@ -136,8 +136,8 @@ struct mock_server
     HAMLIB_ATOMIC int civ_idle_ms;
     int64_t civ_last_idle_ms;
     HAMLIB_ATOMIC int civ_retransmit_requests;  /* requests on the CI-V socket */
-    /* Reply with a frame of this many bytes instead of the canned one
-     * (0 = canned), to give the packet any total length. */
+    /* Override command-aware replies with a frame of this many bytes
+     * (0 = normal reply), to give the packet any total length. */
     HAMLIB_ATOMIC int civ_reply_length;
     /* Send each CI-V reply twice with the same sequence number. */
     HAMLIB_ATOMIC int civ_duplicate_reply;

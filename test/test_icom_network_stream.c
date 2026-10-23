@@ -139,6 +139,21 @@ void test_stream_rig_open_close(void)
     TEST_CHECK(rig->caps->rig_model == RIG_MODEL_IC7610NET);
     TEST_CHECK(rig->caps->port_type == RIG_PORT_CUSTOM);
 
+    freq_t frequency = 0;
+    vfo_t vfo = RIG_VFO_NONE;
+    int dual_watch = -1;
+    value_t key_speed = { 0 };
+    TEST_CHECK(rig_get_freq(rig, RIG_VFO_CURR, &frequency) == RIG_OK);
+    TEST_CHECK(frequency == 14066000);
+    TEST_CHECK(rig_get_vfo(rig, &vfo) == RIG_OK);
+    TEST_CHECK(vfo == RIG_VFO_MAIN);
+    TEST_CHECK(rig_get_func(rig, RIG_VFO_CURR, RIG_FUNC_DUAL_WATCH,
+                            &dual_watch) == RIG_OK);
+    TEST_CHECK(dual_watch == 0);
+    TEST_CHECK(rig_get_level(rig, RIG_VFO_CURR, RIG_LEVEL_KEYSPD,
+                             &key_speed) == RIG_OK);
+    TEST_CHECK(key_speed.i > 0);
+
     rig_close(rig);
     rig_cleanup(rig);
     mock_stop(&mock);

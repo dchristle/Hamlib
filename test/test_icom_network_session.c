@@ -536,6 +536,64 @@ static struct icom_network_session *civ_session(struct mock_server *mock)
     return s;
 }
 
+void test_session_civ_startup_replies_match_requests(void)
+{
+    static const struct
+    {
+        const char *name;
+        uint8_t request[2];
+        size_t request_length;
+        uint8_t response[7];
+        size_t response_length;
+    } cases[] =
+    {
+        { "frequency", { 0x03 }, 1,
+            { 0x03, 0x00, 0x60, 0x06, 0x14, 0x00 }, 6 },
+        { "selected_frequency", { 0x25, 0x00 }, 2,
+            { 0x25, 0x00, 0x00, 0x60, 0x06, 0x14, 0x00 }, 7 },
+        { "unselected_frequency", { 0x25, 0x01 }, 2,
+            { 0x25, 0x01, 0x00, 0x60, 0x06, 0x14, 0x00 }, 7 },
+        { "dualwatch_off", { 0x07, 0xc2 }, 2,
+            { 0x07, 0xc2, 0x00 }, 3 },
+        { "main_selected", { 0x07, 0xd2 }, 2,
+            { 0x07, 0xd2, 0x00 }, 3 },
+        { "key_speed", { 0x14, 0x0c }, 2,
+            { 0x14, 0x0c, 0x01, 0x28 }, 4 },
+        { "unsupported_command", { 0x7f }, 1,
+            { 0xfa }, 1 }
+    };
+    struct mock_server mock;
+    mock_start(&mock);
+    struct icom_network_session *s = civ_session(&mock);
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
+    {
+        TEST_CASE(cases[i].name);
+        uint8_t request[8] = { 0xfe, 0xfe, 0x94, 0xe1 };
+        uint8_t expected[12] = { 0xfe, 0xfe, 0xe1, 0x94 };
+        uint8_t received[32];
+        size_t request_length = cases[i].request_length + 5;
+        size_t response_length = cases[i].response_length + 5;
+        memcpy(request + 4, cases[i].request, cases[i].request_length);
+        request[request_length - 1] = 0xfd;
+        memcpy(expected + 4, cases[i].response, cases[i].response_length);
+        expected[response_length - 1] = 0xfd;
+
+        TEST_ASSERT(icom_network_civ_send(s, request, request_length)
+                    == (int)request_length);
+        int n = icom_network_civ_recv(s, received, sizeof(received), 1000);
+        TEST_CHECK_(n == (int)response_length, "received %d bytes, expected %zu",
+                    n, response_length);
+        if (n == (int)response_length)
+        {
+            TEST_CHECK(memcmp(received, expected, response_length) == 0);
+        }
+    }
+
+    icom_network_session_free(s);
+    mock_stop(&mock);
+}
+
 /* A CI-V reply whose packet happens to be as long as a management packet is
  * still delivered: the CI-V socket classifies by structure, not length. */
 void test_session_civ_reply_with_management_length(void)
@@ -2245,6 +2303,7 @@ TEST_LIST =
     { "broken_udp_no_sigpipe", test_session_broken_udp_no_sigpipe },
 #endif
     { "handshake_and_civ_roundtrip", test_session_handshake_and_civ_roundtrip },
+    { "civ_startup_replies_match_requests", test_session_civ_startup_replies_match_requests },
     { "stale_frame_drain",           test_session_stale_frame_drain },
     { "async_routing",               test_session_async_routing },
     { "audio_rx",                    test_session_audio_rx },

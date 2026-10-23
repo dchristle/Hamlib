@@ -396,13 +396,62 @@ static void mock_civ_stream_open(struct mock_server *m, struct sockaddr_in *from
 /* Answer a CI-V command, optionally preceded by an unsolicited spectrum frame
  * and/or a sequence jump, both of which a test can ask for. */
 static void mock_reply_civ(struct mock_server *m, struct sockaddr_in *from,
-                           socklen_t from_length, uint32_t cli)
+                           socklen_t from_length, uint32_t cli,
+                           const struct icom_network_packet_civ *request)
 {
     uint8_t packet[600];
     uint8_t frame[512];
-    const uint8_t *reply = mock_freq_resp;
-    size_t reply_length = sizeof(mock_freq_resp);
+    const uint8_t *reply = frame;
+    size_t reply_length = 6;
     int pl;
+    const uint8_t *command = request->data;
+    size_t command_length = request->payload_length;
+
+    if (command_length < 6 || command[0] != 0xfe || command[1] != 0xfe
+            || command[command_length - 1] != 0xfd)
+    {
+        return;
+    }
+
+    frame[0] = frame[1] = 0xfe;
+    frame[2] = command[3];
+    frame[3] = command[2];
+    frame[4] = 0xfa;  /* Unsupported commands receive a CI-V NAK. */
+    frame[5] = 0xfd;
+
+    if (command_length == 6 && command[4] == 0x03)
+    {
+        memcpy(frame + 4, mock_freq_resp + 4, sizeof(mock_freq_resp) - 4);
+        reply_length = sizeof(mock_freq_resp);
+    }
+    else if (command_length == 7)
+    {
+        if (command[4] == 0x25 && command[5] <= 1)
+        {
+            frame[4] = command[4];
+            frame[5] = command[5];
+            memcpy(frame + 6, mock_freq_resp + 5, 6);
+            reply_length = 12;
+        }
+        else if (command[4] == 0x07
+                 && (command[5] == 0xc2 || command[5] == 0xd2))
+        {
+            frame[4] = command[4];
+            frame[5] = command[5];
+            frame[6] = 0;  /* Dual watch off; main receiver selected. */
+            frame[7] = 0xfd;
+            reply_length = 8;
+        }
+        else if (command[4] == 0x14 && command[5] == 0x0c)
+        {
+            frame[4] = command[4];
+            frame[5] = command[5];
+            frame[6] = 0x01;
+            frame[7] = 0x28;
+            frame[8] = 0xfd;
+            reply_length = 9;
+        }
+    }
 
     if (m->civ_reply_length >= 6 && m->civ_reply_length <= (int)sizeof(frame))
     {
@@ -631,8 +680,14 @@ static void mock_service_civ(struct mock_server *m, uint8_t *buf, int n,
             break;
 
         case ICOM_NETWORK_PACKET_KIND_CIV:
-            mock_reply_civ(m, from, from_length, cli);
+        {
+            struct icom_network_packet_civ request;
+            if (icom_network_packet_parse_civ(buf, (size_t)n, &request) == RIG_OK)
+            {
+                mock_reply_civ(m, from, from_length, cli, &request);
+            }
             break;
+        }
 
         case ICOM_NETWORK_PACKET_KIND_PING:
             if (buf[0x10] == 0x01)
