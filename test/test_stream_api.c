@@ -803,10 +803,9 @@ void test_tx_rate_above_native(void)
 }
 
 #ifdef HAVE_SAMPLERATE
-static void check_converted_tx_drain_and_cancel(int app_rate, int native_rate)
+static void check_converted_tx_drain_and_cancel(RIG *rig, int app_rate,
+                                               int native_rate)
 {
-    RIG *rig = setup_rig(&stub_caps_ratio_stream);
-    TEST_ASSERT(rig != NULL);
     struct rig_stream_caps session = stub_ratio_stream_caps[1];
     session.sample_rates[0] = native_rate;
     TEST_ASSERT(stream_set_session_caps(rig, &session, 1) == RIG_OK);
@@ -895,13 +894,15 @@ static void check_converted_tx_drain_and_cancel(int app_rate, int native_rate)
 
     rig_stream_close(rig, stream);
     rig_stream_config_free(cfg);
-    teardown_rig(rig);
 }
 
 void test_converted_tx_drain_and_cancel(void)
 {
-    check_converted_tx_drain_and_cancel(48000, 12000);
-    check_converted_tx_drain_and_cancel(12000, 48000);
+    RIG *rig = setup_rig(&stub_caps_ratio_stream);
+    TEST_ASSERT(rig != NULL);
+    check_converted_tx_drain_and_cancel(rig, 48000, 12000);
+    check_converted_tx_drain_and_cancel(rig, 12000, 48000);
+    teardown_rig(rig);
 }
 #endif
 
